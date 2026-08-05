@@ -28,7 +28,7 @@ A **Hermes Desktop Plugin** that embeds a full-featured browser pane into your w
 Copy the line below and paste it to your Hermes Agent:
 
 ```
-Install the Hermes Desktop Plugin from https://github.com/AWhileLater/web-browser-plugin
+Install the Hermes Desktop Plugin from https://github.com/AWhileLater/hermes-desktop-web-browser
 ```
 
 That's it -- Hermes will clone the repository and set everything up automatically.
@@ -36,8 +36,8 @@ That's it -- Hermes will clone the repository and set everything up automaticall
 **Option B -- Manual install**
 
 ```bash
-git clone https://github.com/AWhileLater/web-browser-plugin.git
-cp -r web-browser-plugin ~/.hermes/desktop-plugins/web-browser-plugin
+git clone https://github.com/AWhileLater/hermes-desktop-web-browser.git
+cp -r hermes-desktop-web-browser ~/.hermes/desktop-plugins/hermes-desktop-web-browser
 ```
 
 After either method, reload plugins by running **Reload desktop plugins** from the command palette (`Ctrl+K`).
@@ -52,7 +52,7 @@ After either method, reload plugins by running **Reload desktop plugins** from t
 ## Project Structure
 
 ```
-web-browser-plugin/
+hermes-desktop-web-browser/
 ├── plugin.js         # Main plugin file -- plain ESM JavaScript
 ├── README.md         # This file (English)
 ├── README.zh.md      # Chinese translation
@@ -66,7 +66,7 @@ The plugin is plain ESM JavaScript -- no build step. Save changes to `plugin.js`
 
 ### Conventions
 
-- Plugin ID: `web-browser-plugin`
+- Plugin ID: `hermes-desktop-web-browser`
 - Export signature: `export default { id, name, register(ctx) }`
 - Dependencies limited to `@hermes/plugin-sdk` and `react`
 

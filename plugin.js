@@ -10,7 +10,9 @@
 
 import { jsx } from 'react/jsx-runtime'
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { icons, KEYBINDS_AREA, atom } from '@hermes/plugin-sdk'
+import { icons, KEYBINDS_AREA, atom, usePluginI18n } from '@hermes/plugin-sdk'
+
+const GITHUB_REPO = 'https://github.com/AWhileLater/hermes-desktop-web-browser'
 
 const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i
 const IS_LOCAL = /^localhost\b|^127\.|^10\.|^192\.168\.|^0\.|^::1\b/i
@@ -57,7 +59,7 @@ const NEW_TAB_INTERCEPT_SCRIPT = `
 // 收藏夹下拉菜单
 // ---------------------------------------------------------------------------
 
-function BookmarkMenu({ open, onClose, bookmarks, onAdd, onRemove, onOpen }) {
+function BookmarkMenu({ open, onClose, bookmarks, onAdd, onRemove, onOpen, t }) {
   const menuRef = useRef(null)
 
   useEffect(() => {
@@ -101,7 +103,7 @@ function BookmarkMenu({ open, onClose, bookmarks, onAdd, onRemove, onOpen }) {
               d: 'M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14l-5-4.87 6.91-1.01L12 2z'
             })
           }),
-          jsx('span', { children: 'Add current page' })
+          jsx('span', { children: t('addCurrent') })
         ]
       }),
       bookmarks.length > 0 && jsx('div', { style: { borderTop: '1px solid #3a3a4a' } }),
@@ -295,7 +297,7 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
 // Tab 栏
 // ---------------------------------------------------------------------------
 
-function TabBar({ tabs, activeTabId, onSwitch, onClose, onNewTab }) {
+function TabBar({ tabs, activeTabId, onSwitch, onClose, onNewTab, t }) {
   return jsx('div', {
     className: 'flex shrink-0 items-center border-b border-(--ui-stroke-tertiary) bg-(--ui-surface-background)',
     style: { minHeight: 32 },
@@ -320,7 +322,7 @@ function TabBar({ tabs, activeTabId, onSwitch, onClose, onNewTab }) {
               // 页面标题
               jsx('span', {
                 className: 'truncate',
-                children: tab.title || hostname(tab.url)
+                children: tab.title || (tab.url === 'about:blank' ? t('newTab') : hostname(tab.url))
               }),
               // 关闭按钮
               tabs.length > 1 && jsx('span', {
@@ -337,7 +339,7 @@ function TabBar({ tabs, activeTabId, onSwitch, onClose, onNewTab }) {
         type: 'button',
         onClick: onNewTab,
         className: 'inline-flex size-8 shrink-0 items-center justify-center text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
-        title: 'New Tab',
+        title: t('newTab'),
         children: jsx(icons.Plus, { size: 14, stroke: 2 })
       })
     ]
@@ -349,6 +351,7 @@ function TabBar({ tabs, activeTabId, onSwitch, onClose, onNewTab }) {
 // ---------------------------------------------------------------------------
 
 function BrowserPane({ storage }) {
+  const t = usePluginI18n('web-browser-plugin')
   const [tabs, setTabs] = useState(() => {
     const id = nextTabId()
     return [{ id, url: 'about:blank', title: '' }]
@@ -358,9 +361,11 @@ function BrowserPane({ storage }) {
   const [history, setHistory] = useState({})  // tabId -> { stack, idx }
   const [bookmarks, setBookmarks] = useState(() => storage.get('bookmarks', []))
   const [menuOpen, setMenuOpen] = useState(false)
+  const [hamburgerOpen, setHamburgerOpen] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [reinjectFlag, setReinjectFlag] = useState(0)
 
+  const hamburgerRef = useRef(null)
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0]
 
   // 获取/初始化某个 tab 的历史记录
@@ -429,13 +434,6 @@ function BrowserPane({ storage }) {
     }, 50)
   }, [tabs])
 
-  // ── 手动注入拦截脚本到当前 tab ──
-  const injectIntoActiveTab = useCallback(() => {
-    // 通知 TabWebview 组件重新注入
-    // 通过触发一个状态更新让 TabWebview 重新运行 injectInterceptScript
-    setReinjectFlag((n) => n + 1)
-  }, [])
-
   // ── Tab 内导航回调 ──
   const handleTabNavigate = useCallback((tabId, url) => {
     setTabs((prev) => prev.map((t) => t.id === tabId ? { ...t, url } : t))
@@ -487,10 +485,29 @@ function BrowserPane({ storage }) {
   }, [activeTabId, updateTabHistory])
 
   const closeMenu = useCallback(() => setMenuOpen(false), [])
+  const closeHamburger = useCallback(() => setHamburgerOpen(false), [])
+
+  // 汉堡菜单点击外部关闭
+  useEffect(() => {
+    if (!hamburgerOpen) return
+    const handleClick = (e) => {
+      if (hamburgerRef.current && !hamburgerRef.current.contains(e.target)) {
+        setHamburgerOpen(false)
+      }
+    }
+    const handleEsc = (e) => { if (e.key === 'Escape') setHamburgerOpen(false) }
+    document.addEventListener('mousedown', handleClick)
+    document.addEventListener('keydown', handleEsc)
+    return () => {
+      document.removeEventListener('mousedown', handleClick)
+      document.removeEventListener('keydown', handleEsc)
+    }
+  }, [hamburgerOpen])
 
   // ── 导航 ──
   const navigate = useCallback(() => {
     closeMenu()
+    closeHamburger()
     const target = normalizeUrl(inputUrl)
     if (!target) return
     setTabs((prev) => prev.map((t) => t.id === activeTabId ? { ...t, url: target } : t))
@@ -502,6 +519,7 @@ function BrowserPane({ storage }) {
   }, [inputUrl, activeTabId, updateTabHistory])
 
   const goBack = useCallback(() => {
+    closeHamburger()
     const h = getTabHistory(activeTabId)
     if (h.idx <= 0) return
     const newIdx = h.idx - 1
@@ -512,6 +530,7 @@ function BrowserPane({ storage }) {
   }, [activeTabId, getTabHistory, updateTabHistory])
 
   const goForward = useCallback(() => {
+    closeHamburger()
     const h = getTabHistory(activeTabId)
     if (h.idx >= h.stack.length - 1) return
     const newIdx = h.idx + 1
@@ -537,7 +556,8 @@ function BrowserPane({ storage }) {
         activeTabId,
         onSwitch: switchTab,
         onClose: closeTab,
-        onNewTab: () => createTab()
+        onNewTab: () => createTab(),
+        t: t
       }),
 
       // ── 工具栏 ──
@@ -577,16 +597,6 @@ function BrowserPane({ storage }) {
             className: 'inline-flex size-6 items-center justify-center rounded text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
             children: jsx(icons.RefreshCw, { size: 14, stroke: 2 })
           }),
-          // 注入按钮（调试用）
-          jsx('button', {
-            type: 'button',
-            onClick: () => { injectIntoActiveTab() },
-            className: 'inline-flex size-6 items-center justify-center rounded text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
-            title: 'Re-inject tab monitor',
-            children: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:12, height:12, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2,
-              children: jsx('path', { d:'M5 12h14M12 5l-7 7 7 7' })
-            })
-          }),
           // ★ 收藏按钮
           jsx('div', {
             className: 'relative',
@@ -599,7 +609,7 @@ function BrowserPane({ storage }) {
                   'inline-flex size-6 items-center justify-center rounded text-xs',
                   isBookmarked ? 'text-yellow-400' : 'text-(--ui-text-tertiary)'
                 ].join(' '),
-                title: isBookmarked ? 'Bookmarked' : 'Bookmark this page',
+                title: isBookmarked ? t('bookmarked') : t('bookmarkPage'),
                 children: jsx('svg', {
                   xmlns: 'http://www.w3.org/2000/svg', width: 16, height: 16,
                   viewBox: '0 0 24 24',
@@ -614,7 +624,8 @@ function BrowserPane({ storage }) {
               }),
               jsx(BookmarkMenu, {
                 open: menuOpen, onClose: () => setMenuOpen(false),
-                bookmarks, onAdd: addBookmark, onRemove: removeBookmark, onOpen: openBookmark
+                bookmarks, onAdd: addBookmark, onRemove: removeBookmark, onOpen: openBookmark,
+                t: t
               })
             ]
           }),
@@ -623,7 +634,7 @@ function BrowserPane({ storage }) {
             type: 'text', value: inputUrl,
             onChange: (e) => setInputUrl(e.target.value),
             onKeyDown: handleKeyDown, onFocus: closeMenu,
-            placeholder: 'Enter a URL…',
+            placeholder: t('enterUrl'),
             className: 'h-7 flex-1 rounded border border-(--ui-stroke-secondary) bg-(--ui-input-background) px-2 text-xs text-(--ui-text-primary) outline-none focus:border-(--ui-accent)'
           }),
           // Go
@@ -631,6 +642,61 @@ function BrowserPane({ storage }) {
             type: 'button', onClick: navigate,
             className: 'inline-flex h-7 items-center justify-center rounded bg-(--ui-accent) px-2 text-(--ui-accent-foreground) hover:opacity-90',
             children: jsx(icons.Send, { size: 14, stroke: 2 })
+          }),
+          // 汉堡按钮
+          jsx('div', {
+            ref: hamburgerRef,
+            className: 'relative',
+            children: [
+              jsx('button', {
+                type: 'button',
+                onClick: () => setHamburgerOpen(!hamburgerOpen),
+                onFocus: closeMenu,
+                className: 'inline-flex size-7 items-center justify-center rounded text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
+                title: t('pluginMenu'),
+                children: jsx('svg', {
+                  xmlns: 'http://www.w3.org/2000/svg', width: 14, height: 14,
+                  viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+                  strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round',
+                  children: [
+                    jsx('line', { x1: '4', y1: '6', x2: '20', y2: '6' }),
+                    jsx('line', { x1: '4', y1: '12', x2: '20', y2: '12' }),
+                    jsx('line', { x1: '4', y1: '18', x2: '20', y2: '18' }),
+                  ]
+                })
+              }),
+              // 下拉菜单
+              hamburgerOpen && jsx('div', {
+                style: {
+                  position: 'absolute', top: '100%', right: 0, zIndex: 50, marginTop: 4,
+                  width: 160, borderRadius: 6, border: '1px solid #3a3a4a',
+                  backgroundColor: '#1e1e2e', boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+                },
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    onClick: () => { window.open(GITHUB_REPO, '_blank'); setHamburgerOpen(false) },
+                    style: {
+                      display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+                      padding: '8px 12px', fontSize: 12, color: '#e0e0e0',
+                      backgroundColor: 'transparent', border: 'none', cursor: 'pointer',
+                    },
+                    children: [
+                      jsx('svg', {
+                        xmlns: 'http://www.w3.org/2000/svg', width: 14, height: 14,
+                        viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+                        strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round',
+                        style: { flexShrink: 0 },
+                        children: [
+                          jsx('path', { d: 'M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22' }),
+                        ],
+                      }),
+                      jsx('span', { children: t('about') }),
+                    ]
+                  }),
+                ]
+              }),
+            ]
           })
         ]
       }),
@@ -656,22 +722,107 @@ function BrowserPane({ storage }) {
 }
 
 // ---------------------------------------------------------------------------
+// LauncherPane — 插件启动器面板（统一状态栏图标 -> 菜单 -> 打开对应面板）
+// ---------------------------------------------------------------------------
+
+function LauncherPane({ onClose, t }) {
+  const items = [
+    {
+      id: 'web-browser',
+      label: t('launcherBrowser'),
+      icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:18, height:18, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
+        children: [
+          jsx('path', { d: 'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0' }),
+          jsx('path', { d: 'M3.6 9h16.8' }),
+          jsx('path', { d: 'M11.5 3a17 17 0 0 0 0 18' }),
+          jsx('path', { d: 'M12.5 3a17 17 0 0 1 0 18' }),
+        ]
+      }),
+    },
+    {
+      id: 'token-usage-stats',
+      label: t('launcherUsage'),
+      icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:18, height:18, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
+        children: [
+          jsx('path', { d: 'M4 20h16' }),
+          jsx('path', { d: 'M6 16l4-4 4 4 4-4' }),
+          jsx('path', { d: 'M6 12l4-4 4 4 4-4' }),
+        ]
+      }),
+    },
+  ]
+
+  return jsx('div', {
+    className: 'flex h-full flex-col p-3 gap-1.5',
+    children: [
+      jsx('div', {
+        className: 'text-xs font-medium text-(--ui-text-secondary) px-2 pb-2 border-b border-(--ui-stroke-tertiary)',
+        children: t('launcherTitle'),
+      }),
+      jsx('div', {
+        className: 'flex flex-col gap-1 pt-2',
+        children: items.map(function(item) {
+          return jsx('button', {
+            key: item.id,
+            type: 'button',
+            onClick: function() {
+              var toggle = window.__pluginToggles && window.__pluginToggles[item.id]
+              if (toggle) toggle()
+              if (onClose) onClose()
+            },
+            className: 'flex items-center gap-3 w-full rounded-md px-3 py-2.5 text-sm text-(--ui-text-primary) hover:bg-(--chrome-action-hover) transition-colors cursor-pointer border-none text-left',
+            children: [
+              jsx('span', {
+                className: 'shrink-0 text-(--ui-text-secondary)',
+                children: item.icon,
+              }),
+              jsx('span', { children: item.label }),
+            ]
+          })
+        })
+      }),
+    ]
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Plugin entry
 // ---------------------------------------------------------------------------
 
 export default {
-  id: 'web-browser-plugin',
+  id: 'hermes-desktop-web-browser',
   name: 'Web Browser',
   defaultEnabled: true,
 
   register(ctx) {
-    const $visible = atom(true)
+    ctx.i18n.register({
+      zh: {
+        paneTitle: '浏览器', pluginName: '浏览器', toggleLabel: '切换浏览器面板',
+        newTab: '新建标签页', enterUrl: '输入网址…',
+        bookmarked: '已收藏', bookmarkPage: '收藏此页',
+        addCurrent: '添加当前页面', pluginMenu: '插件菜单', about: '关于',
+        launcherTitle: '启动器',
+        launcherBrowser: '浏览器', launcherUsage: '用量统计',
+      },
+      en: {
+        paneTitle: 'Browser', pluginName: 'Web Browser', toggleLabel: 'Toggle Browser Pane',
+        newTab: 'New Tab', enterUrl: 'Enter a URL…',
+        bookmarked: 'Bookmarked', bookmarkPage: 'Bookmark this page',
+        addCurrent: 'Add current page', pluginMenu: 'Plugin Menu', about: 'About',
+        launcherTitle: 'Launcher',
+        launcherBrowser: 'Browser', launcherUsage: 'Usage Stats',
+      }
+    })
+
+    // ── 浏览器面板 ──
+    const $visible = atom(false)
 
     const registerPane = (visible) => {
+      const t = ctx.i18n.t
       ctx.register({
         id: 'pane',
         area: 'panes',
-        title: 'Browser',
+        title: t('paneTitle'),
         order: 30,
         enabled: visible,
         data: {
@@ -689,36 +840,73 @@ export default {
       registerPane(next)
     }
 
-    registerPane(true)
+    registerPane(false)
 
+    // 暴露浏览器 toggle 给全局启动器
+    window.__pluginToggles = window.__pluginToggles || {}
+    window.__pluginToggles['web-browser'] = togglePane
+
+    // ── 快捷键（直接切换浏览器面板）──
     ctx.register({
       id: 'toggle',
       area: KEYBINDS_AREA,
-      label: 'Toggle Browser Pane',
+      label: ctx.i18n.t('toggleLabel'),
       defaults: ['ctrl+shift+b'],
       run: togglePane
     })
 
+    // ── 统一状态栏图标 + 右键菜单 ──
     ctx.register({
-      id: 'titlebar',
-      area: 'titleBar.tools.right',
+      id: 'plugin-launcher-toggle',
+      area: 'statusBar.right',
+      order: 50,
       data: {
-        id: 'web-browser-toggle',
-        label: 'Browser',
-        title: 'Browser Plugin',
+        id: 'plugin-launcher',
         icon: jsx('svg', {
-          xmlns: 'http://www.w3.org/2000/svg', width: 14, height: 14,
+          xmlns: 'http://www.w3.org/2000/svg', width: 12, height: 12,
           viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
           strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round',
           children: [
-            jsx('path', { d: 'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0' }),
-            jsx('path', { d: 'M3.6 9h16.8' }),
-            jsx('path', { d: 'M3.6 15h16.8' }),
-            jsx('path', { d: 'M11.5 3a17 17 0 0 0 0 18' }),
-            jsx('path', { d: 'M12.5 3a17 17 0 0 1 0 18' })
+            jsx('rect', { x: '3', y: '3', width: '7', height: '7', rx: '1' }),
+            jsx('rect', { x: '14', y: '3', width: '7', height: '7', rx: '1' }),
+            jsx('rect', { x: '14', y: '14', width: '7', height: '7', rx: '1' }),
+            jsx('rect', { x: '3', y: '14', width: '7', height: '7', rx: '1' }),
           ]
         }),
-        onSelect: togglePane
+        variant: 'menu',
+        menuItems: [
+          {
+            id: 'web-browser',
+            label: ctx.i18n.t('launcherBrowser'),
+            icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:14, height:14, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
+              children: [
+                jsx('path', { d: 'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0' }),
+                jsx('path', { d: 'M3.6 9h16.8' }),
+                jsx('path', { d: 'M11.5 3a17 17 0 0 0 0 18' }),
+                jsx('path', { d: 'M12.5 3a17 17 0 0 1 0 18' }),
+              ]
+            }),
+            onSelect: function() {
+              var toggle = window.__pluginToggles && window.__pluginToggles['web-browser']
+              if (toggle) toggle()
+            }
+          },
+          {
+            id: 'token-usage-stats',
+            label: ctx.i18n.t('launcherUsage'),
+            icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:14, height:14, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
+              children: [
+                jsx('path', { d: 'M4 20h16' }),
+                jsx('path', { d: 'M6 16l4-4 4 4 4-4' }),
+                jsx('path', { d: 'M6 12l4-4 4 4 4-4' }),
+              ]
+            }),
+            onSelect: function() {
+              var toggle = window.__pluginToggles && window.__pluginToggles['token-usage-stats']
+              if (toggle) toggle()
+            }
+          }
+        ]
       }
     })
   }

@@ -28,7 +28,7 @@
 直接复制下面这行，发给你的 Hermes Agent 即可：
 
 ```
-帮我安装这个 Hermes Desktop 插件：https://github.com/AWhileLater/web-browser-plugin
+帮我安装这个 Hermes Desktop 插件：https://github.com/AWhileLater/hermes-desktop-web-browser
 ```
 
 一句话搞定，Hermes 会自动克隆仓库并配置好。
@@ -36,8 +36,8 @@
 **方式 B -- 手动安装**
 
 ```bash
-git clone https://github.com/AWhileLater/web-browser-plugin.git
-cp -r web-browser-plugin ~/.hermes/desktop-plugins/web-browser-plugin
+git clone https://github.com/AWhileLater/hermes-desktop-web-browser.git
+cp -r hermes-desktop-web-browser ~/.hermes/desktop-plugins/hermes-desktop-web-browser
 ```
 
 两种方式完成后，在命令面板（`Ctrl+K`）中运行 **Reload desktop plugins** 重新加载即可。
@@ -52,8 +52,8 @@ cp -r web-browser-plugin ~/.hermes/desktop-plugins/web-browser-plugin
 ## 项目结构
 
 ```
-web-browser-plugin/
-├── plugin.js         # 插件主文件 -- 纯 ESM JavaScript
+hermes-desktop-web-browser/
+├── plugin.js         # 主插件文件 -- 纯 ESM JavaScript
 ├── README.md         # 英文文档
 ├── README.zh.md      # 中文文档（本文件）
 ├── LICENSE           # MIT 许可证
@@ -66,7 +66,7 @@ web-browser-plugin/
 
 ### 约定
 
-- 插件 ID: `web-browser-plugin`
+- 插件 ID: `hermes-desktop-web-browser`
 - 导出格式: `export default { id, name, register(ctx) }`
 - 依赖仅限 `@hermes/plugin-sdk` 和 `react`
 
