@@ -11,3 +11,7 @@ Thumbs.db
 
 # Misc
 *.log
+
+# Python
+__pycache__/
+*.pyc

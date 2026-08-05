@@ -1,6 +1,6 @@
 # Web Browser Plugin
 
-A **Hermes Desktop Plugin** that embeds a full-featured browser pane into your workspace. Browse the web directly inside Hermes -- no window switching required.
+A **Hermes Desktop Plugin** that embeds a webview browser pane into your workspace, so you can browse the web without switching windows. It also includes page annotation: mark elements on a page and add notes, then send them to your AI agent for auto-located edits.
 
 [中文文档](README.zh.md)
 
@@ -8,12 +8,48 @@ A **Hermes Desktop Plugin** that embeds a full-featured browser pane into your w
 
 ## Features
 
-- **Embedded iframe browser** -- render web pages in a Hermes side panel
-- **Back/Forward navigation** -- history stack with prev/next buttons
-- **Refresh** -- one-click page reload
-- **Bookmarks** -- drop-down menu with add/remove, persisted via `ctx.storage`
-- **Keyboard shortcut** -- `Ctrl+Shift+B` to toggle the panel
-- **Status bar toggle** -- globe icon to show/hide the browser pane
+- **Embedded browser** -- a real browser embedded in Hermes: multi-tab webview, address bar, navigation, bookmarks, and more
+- **Page annotation** -- mark elements on a page, add notes with quick tags, and send them to your AI agent for auto-located edits (see [Annotator](#annotator))
+- **Cache control** -- disable browser cache (non-persistent session) and clear cache from settings
+
+## Annotator
+
+A visual annotation → auto-edit workflow: mark any element on a page, send the annotation to your AI agent, and the agent locates the corresponding code and applies your change -- whether it is a bug fix, a style adjustment, a layout tweak, or a new feature. You only describe what to change; no need to say where or how.
+
+### How it works
+
+1. Click the pen button in the toolbar to enter annotation mode
+2. Click the element on the page that needs changing / adjusting / fixing -- a note popover appears
+3. Type what should be done (or pick a quick tag), then save
+4. Copy the prompt (or prompt + labeled screenshot) and send it to the agent / paste it into the chat
+5. The agent locates the problem element and modifies the code according to your note
+
+### Why it works: the agent knows exactly where
+
+Every annotation carries precise locators -- **selector**, **domPath**, **text**, **position** -- plus the page URL and viewport. The agent uses these to find the exact element in the project's source and applies your instruction. You only describe what needs to change; the agent handles the "where".
+
+### Quick tags
+
+Quick tags auto-fill common modification instructions: **Bug**, **Style**, **Layout**, **Feature**, **Optimize**, **Interaction**. Click a tag to fill the note input, then tweak if needed.
+
+### Copy & paste
+
+- **Copy to input** -- one click copies it directly into the Hermes chat composer
+- **Copy prompt** -- structured text (instruction + locators) ready to send to your agent
+- **Copy prompt + screenshot** -- adds a labeled screenshot of the page; the prompt includes a screenshot hint
+
+### Managing annotations
+
+The annotation panel lists all annotations with edit / delete / clear. Each annotation stays highlighted on the page with a numbered bubble, and the overlay follows the element while you scroll.
+
+### Settings
+
+- **Include screenshot when copying** -- on by default; the screenshot provides auxiliary location cues (helps the agent confirm the target element visually). Turn it off if your model does not support vision (image analysis): no screenshot is taken and the prompt omits screenshot hints. Element location does not rely on vision -- the annotation's selector / domPath / text are enough for the agent to find it.
+- **Quick annotation tags** -- when off, the tag row is hidden in the note popover
+
+### Under the hood
+
+The annotation engine is injected into each page via `executeJavaScript` and talks to the plugin over a `console-message` bridge (the `__ANNO__` prefix) with a polling fallback.
 
 ## Installation
 
@@ -45,19 +81,25 @@ After either method, reload plugins by running **Reload desktop plugins** from t
 ## Usage
 
 1. Click the globe icon in the Hermes Desktop status bar, or press `Ctrl+Shift+B` to open the browser panel
-2. Type a URL in the address bar and press Enter (or click the Go button)
-3. Use the toolbar buttons for back/forward/refresh
+2. Type a URL in the address bar and press Enter
+3. Use the toolbar buttons for back/forward/refresh; right-click a tab for close/reload/copy URL
 4. Click the star to bookmark the current page
+5. Use the pen button to annotate: click elements on the page, add a note (or pick a quick tag), then copy to clipboard or paste into the chat
+6. Open settings (hamburger menu > Plugin Settings):
+   - **Browser** section: disable browser cache for development (new tabs use a non-persistent session), clear cache
+   - **Annotate** section: include screenshot when copying (off = no screenshot and no screenshot hint in the prompt), quick annotation tags
 
 ## Project Structure
 
 ```
 hermes-desktop-web-browser/
-├── plugin.js         # Main plugin file -- plain ESM JavaScript
-├── README.md         # This file (English)
-├── README.zh.md      # Chinese translation
-├── LICENSE           # MIT License
-└── screenshot.png    # Screenshot in action
+├── plugin.js             # Main plugin file -- plain ESM JavaScript
+├── script/
+│   └── clear_cache.py    # Cache-clearing script (removes the plugin partition's disk cache)
+├── README.md             # This file (English)
+├── README.zh.md          # Chinese translation
+├── LICENSE               # MIT License
+└── screenshot.png        # Screenshot in action
 ```
 
 ## Development
