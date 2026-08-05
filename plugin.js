@@ -722,70 +722,6 @@ function BrowserPane({ storage }) {
 }
 
 // ---------------------------------------------------------------------------
-// LauncherPane — 插件启动器面板（统一状态栏图标 -> 菜单 -> 打开对应面板）
-// ---------------------------------------------------------------------------
-
-function LauncherPane({ onClose, t }) {
-  const items = [
-    {
-      id: 'web-browser',
-      label: t('launcherBrowser'),
-      icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:18, height:18, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
-        children: [
-          jsx('path', { d: 'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0' }),
-          jsx('path', { d: 'M3.6 9h16.8' }),
-          jsx('path', { d: 'M11.5 3a17 17 0 0 0 0 18' }),
-          jsx('path', { d: 'M12.5 3a17 17 0 0 1 0 18' }),
-        ]
-      }),
-    },
-    {
-      id: 'token-usage-stats',
-      label: t('launcherUsage'),
-      icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:18, height:18, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
-        children: [
-          jsx('path', { d: 'M4 20h16' }),
-          jsx('path', { d: 'M6 16l4-4 4 4 4-4' }),
-          jsx('path', { d: 'M6 12l4-4 4 4 4-4' }),
-        ]
-      }),
-    },
-  ]
-
-  return jsx('div', {
-    className: 'flex h-full flex-col p-3 gap-1.5',
-    children: [
-      jsx('div', {
-        className: 'text-xs font-medium text-(--ui-text-secondary) px-2 pb-2 border-b border-(--ui-stroke-tertiary)',
-        children: t('launcherTitle'),
-      }),
-      jsx('div', {
-        className: 'flex flex-col gap-1 pt-2',
-        children: items.map(function(item) {
-          return jsx('button', {
-            key: item.id,
-            type: 'button',
-            onClick: function() {
-              var toggle = window.__pluginToggles && window.__pluginToggles[item.id]
-              if (toggle) toggle()
-              if (onClose) onClose()
-            },
-            className: 'flex items-center gap-3 w-full rounded-md px-3 py-2.5 text-sm text-(--ui-text-primary) hover:bg-(--chrome-action-hover) transition-colors cursor-pointer border-none text-left',
-            children: [
-              jsx('span', {
-                className: 'shrink-0 text-(--ui-text-secondary)',
-                children: item.icon,
-              }),
-              jsx('span', { children: item.label }),
-            ]
-          })
-        })
-      }),
-    ]
-  })
-}
-
-// ---------------------------------------------------------------------------
 // Plugin entry
 // ---------------------------------------------------------------------------
 
@@ -801,16 +737,14 @@ export default {
         newTab: '新建标签页', enterUrl: '输入网址…',
         bookmarked: '已收藏', bookmarkPage: '收藏此页',
         addCurrent: '添加当前页面', pluginMenu: '插件菜单', about: '关于',
-        launcherTitle: '启动器',
-        launcherBrowser: '浏览器', launcherUsage: '用量统计',
+        launcherBrowser: '浏览器',
       },
       en: {
         paneTitle: 'Browser', pluginName: 'Web Browser', toggleLabel: 'Toggle Browser Pane',
         newTab: 'New Tab', enterUrl: 'Enter a URL…',
         bookmarked: 'Bookmarked', bookmarkPage: 'Bookmark this page',
         addCurrent: 'Add current page', pluginMenu: 'Plugin Menu', about: 'About',
-        launcherTitle: 'Launcher',
-        launcherBrowser: 'Browser', launcherUsage: 'Usage Stats',
+        launcherBrowser: 'Browser',
       }
     })
 
@@ -855,76 +789,77 @@ export default {
       run: togglePane
     })
 
-    // ── 统一状态栏图标 + 右键菜单 ──
-    ctx.register({
-      id: 'plugin-launcher-toggle',
-      area: 'statusBar.right',
-      order: 50,
-      data: {
-        id: 'plugin-launcher',
-        icon: jsx('svg', {
-          xmlns: 'http://www.w3.org/2000/svg', width: 12, height: 12,
-          viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
-          strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round',
-          children: [
-            jsx('rect', { x: '3', y: '3', width: '7', height: '7', rx: '1' }),
-            jsx('rect', { x: '14', y: '3', width: '7', height: '7', rx: '1' }),
-            jsx('rect', { x: '14', y: '14', width: '7', height: '7', rx: '1' }),
-            jsx('rect', { x: '3', y: '14', width: '7', height: '7', rx: '1' }),
-          ]
-        }),
-        variant: 'menu',
-        // 动态聚合：菜单打开时从 window.__pluginToggles 过滤已加载的插件，
-        // 只装本插件时不会出现「用量统计」空项；加载顺序问题也天然消除。
-        menuContent: function(close) {
-          var toggles = window.__pluginToggles || {}
-          var entries = [
-            {
-              id: 'web-browser',
-              label: ctx.i18n.t('launcherBrowser'),
-              icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:14, height:14, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
-                children: [
-                  jsx('path', { d: 'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0' }),
-                  jsx('path', { d: 'M3.6 9h16.8' }),
-                  jsx('path', { d: 'M11.5 3a17 17 0 0 0 0 18' }),
-                  jsx('path', { d: 'M12.5 3a17 17 0 0 1 0 18' }),
-                ]
-              })
-            },
-            {
-              id: 'token-usage-stats',
-              label: ctx.i18n.t('launcherUsage'),
-              icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:14, height:14, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
-                children: [
-                  jsx('path', { d: 'M4 20h16' }),
-                  jsx('path', { d: 'M6 16l4-4 4 4 4-4' }),
-                  jsx('path', { d: 'M6 12l4-4 4 4 4-4' }),
-                ]
-              })
-            }
-          ].filter(function(e) { return toggles[e.id] })
+    // ── 全局启动器协议 ──
+    // 每个插件启动时把自己的菜单项贡献到 window.__pluginLauncher；
+    // 四宫格图标由「owner」插件负责注册：第一个启动的插件成为 owner；
+    // 热重载后 owner 插件重新注册（ctx.register 同 id 自动 replace），
+    // 非 owner 插件只贡献项、不建独立图标。
+    window.__pluginLauncher = window.__pluginLauncher || { owner: null, items: {} }
+    window.__pluginLauncher.items['web-browser'] = {
+      label: ctx.i18n.t('launcherBrowser'),
+      icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:14, height:14, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
+        children: [
+          jsx('path', { d: 'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0' }),
+          jsx('path', { d: 'M3.6 9h16.8' }),
+          jsx('path', { d: 'M11.5 3a17 17 0 0 0 0 18' }),
+          jsx('path', { d: 'M12.5 3a17 17 0 0 1 0 18' }),
+        ]
+      })
+    }
 
-          return jsx('div', {
-            className: 'p-1 flex flex-col gap-0.5',
-            children: entries.map(function(e) {
-              return jsx('button', {
-                key: e.id,
-                type: 'button',
-                onClick: function() {
-                  var toggle = toggles[e.id]
-                  if (toggle) toggle()
-                  close()
-                },
-                className: 'flex items-center gap-2 w-full rounded-md px-2 py-1.5 text-sm text-(--ui-text-primary) hover:bg-(--chrome-action-hover) transition-colors cursor-pointer border-none text-left',
-                children: [
-                  jsx('span', { className: 'shrink-0 text-(--ui-text-secondary)', children: e.icon }),
-                  jsx('span', { children: e.label })
-                ]
+    if (!window.__pluginLauncher.owner || window.__pluginLauncher.owner === 'hermes-desktop-web-browser') {
+      window.__pluginLauncher.owner = 'hermes-desktop-web-browser'
+      ctx.register({
+        id: 'plugin-launcher-toggle',
+        area: 'statusBar.right',
+        order: 50,
+        data: {
+          id: 'plugin-launcher',
+          icon: jsx('svg', {
+            xmlns: 'http://www.w3.org/2000/svg', width: 12, height: 12,
+            viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+            strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round',
+            children: [
+              jsx('rect', { x: '3', y: '3', width: '7', height: '7', rx: '1' }),
+              jsx('rect', { x: '14', y: '3', width: '7', height: '7', rx: '1' }),
+              jsx('rect', { x: '14', y: '14', width: '7', height: '7', rx: '1' }),
+              jsx('rect', { x: '3', y: '14', width: '7', height: '7', rx: '1' }),
+            ]
+          }),
+          variant: 'menu',
+          // 动态聚合：打开菜单时才渲染，从全局注册表读取所有已贡献项，
+          // 再按 __pluginToggles 过滤已加载的插件 —— 加载顺序无关，天然正确。
+          menuContent: function(close) {
+            var launcher = window.__pluginLauncher || { items: {} }
+            var toggles = window.__pluginToggles || {}
+            var entries = Object.keys(launcher.items)
+              .map(function(id) {
+                return { id: id, label: launcher.items[id].label, icon: launcher.items[id].icon }
+              })
+              .filter(function(e) { return toggles[e.id] })
+
+            return jsx('div', {
+              className: 'p-1 flex flex-col gap-0.5',
+              children: entries.map(function(e) {
+                return jsx('button', {
+                  key: e.id,
+                  type: 'button',
+                  onClick: function() {
+                    var toggle = toggles[e.id]
+                    if (toggle) toggle()
+                    close()
+                  },
+                  className: 'flex items-center gap-2 w-full rounded-md px-2 py-1.5 text-sm text-(--ui-text-primary) hover:bg-(--chrome-action-hover) transition-colors cursor-pointer border-none text-left',
+                  children: [
+                    jsx('span', { className: 'shrink-0 text-(--ui-text-secondary)', children: e.icon }),
+                    jsx('span', { children: e.label })
+                  ]
+                })
               })
             })
-          })
+          }
         }
-      }
-    })
+      })
+    }
   }
 }
