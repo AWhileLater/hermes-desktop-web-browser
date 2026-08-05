@@ -640,7 +640,7 @@ function BrowserPane({ storage }) {
           // Go
           jsx('button', {
             type: 'button', onClick: navigate,
-            className: 'inline-flex h-7 items-center justify-center rounded bg-(--ui-accent) px-2 text-(--ui-accent-foreground) hover:opacity-90',
+            className: 'inline-flex size-7 items-center justify-center rounded text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
             children: jsx(icons.Send, { size: 14, stroke: 2 })
           }),
           // 汉堡按钮
