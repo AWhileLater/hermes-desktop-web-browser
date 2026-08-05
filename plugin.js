@@ -791,9 +791,9 @@ export default {
 
     // ── 全局启动器协议 ──
     // 每个插件启动时把自己的菜单项贡献到 window.__pluginLauncher；
-    // 四宫格图标由「owner」插件负责注册：第一个启动的插件成为 owner；
-    // 热重载后 owner 插件重新注册（ctx.register 同 id 自动 replace），
-    // 非 owner 插件只贡献项、不建独立图标。
+    // 四宫格图标由「owner」插件注册：第一个启动的成为 owner；
+    // owner 被禁用时广播事件，其他存活插件接管；热重载后 owner
+    // 重新注册（ctx.register 同 id 自动 replace）。
     window.__pluginLauncher = window.__pluginLauncher || { owner: null, items: {} }
     window.__pluginLauncher.items['web-browser'] = {
       label: ctx.i18n.t('launcherBrowser'),
@@ -807,10 +807,11 @@ export default {
       })
     }
 
-    if (!window.__pluginLauncher.owner || window.__pluginLauncher.owner === 'hermes-desktop-web-browser') {
-      window.__pluginLauncher.owner = 'hermes-desktop-web-browser'
-      ctx.register({
-        id: 'plugin-launcher-toggle',
+    const becomeLauncherOwner = () => {
+      if (!window.__pluginLauncher.owner || window.__pluginLauncher.owner === 'hermes-desktop-web-browser') {
+        window.__pluginLauncher.owner = 'hermes-desktop-web-browser'
+        ctx.register({
+          id: 'plugin-launcher-toggle',
         area: 'statusBar.right',
         order: 50,
         data: {
@@ -860,6 +861,24 @@ export default {
           }
         }
       })
+      }
     }
+    becomeLauncherOwner()
+
+    // owner 失效接管：owner 插件被禁用/卸载时（onDispose 广播），
+    // 本插件若仍存活则接替注册四宫格，保证入口不消失。
+    const onLauncherOwnerGone = () => {
+      if (window.__pluginLauncher && !window.__pluginLauncher.owner) {
+        becomeLauncherOwner()
+      }
+    }
+    window.addEventListener('hermes:launcher-owner-gone', onLauncherOwnerGone)
+    ctx.onDispose(() => {
+      window.removeEventListener('hermes:launcher-owner-gone', onLauncherOwnerGone)
+      if (window.__pluginLauncher && window.__pluginLauncher.owner === 'hermes-desktop-web-browser') {
+        window.__pluginLauncher.owner = null
+        window.dispatchEvent(new Event('hermes:launcher-owner-gone'))
+      }
+    })
   }
 }
