@@ -874,39 +874,56 @@ export default {
           ]
         }),
         variant: 'menu',
-        menuItems: [
-          {
-            id: 'web-browser',
-            label: ctx.i18n.t('launcherBrowser'),
-            icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:14, height:14, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
-              children: [
-                jsx('path', { d: 'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0' }),
-                jsx('path', { d: 'M3.6 9h16.8' }),
-                jsx('path', { d: 'M11.5 3a17 17 0 0 0 0 18' }),
-                jsx('path', { d: 'M12.5 3a17 17 0 0 1 0 18' }),
-              ]
-            }),
-            onSelect: function() {
-              var toggle = window.__pluginToggles && window.__pluginToggles['web-browser']
-              if (toggle) toggle()
+        // 动态聚合：菜单打开时从 window.__pluginToggles 过滤已加载的插件，
+        // 只装本插件时不会出现「用量统计」空项；加载顺序问题也天然消除。
+        menuContent: function(close) {
+          var toggles = window.__pluginToggles || {}
+          var entries = [
+            {
+              id: 'web-browser',
+              label: ctx.i18n.t('launcherBrowser'),
+              icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:14, height:14, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
+                children: [
+                  jsx('path', { d: 'M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0' }),
+                  jsx('path', { d: 'M3.6 9h16.8' }),
+                  jsx('path', { d: 'M11.5 3a17 17 0 0 0 0 18' }),
+                  jsx('path', { d: 'M12.5 3a17 17 0 0 1 0 18' }),
+                ]
+              })
+            },
+            {
+              id: 'token-usage-stats',
+              label: ctx.i18n.t('launcherUsage'),
+              icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:14, height:14, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
+                children: [
+                  jsx('path', { d: 'M4 20h16' }),
+                  jsx('path', { d: 'M6 16l4-4 4 4 4-4' }),
+                  jsx('path', { d: 'M6 12l4-4 4 4 4-4' }),
+                ]
+              })
             }
-          },
-          {
-            id: 'token-usage-stats',
-            label: ctx.i18n.t('launcherUsage'),
-            icon: jsx('svg', { xmlns:'http://www.w3.org/2000/svg', width:14, height:14, viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', strokeWidth:2, strokeLinecap:'round', strokeLinejoin:'round',
-              children: [
-                jsx('path', { d: 'M4 20h16' }),
-                jsx('path', { d: 'M6 16l4-4 4 4 4-4' }),
-                jsx('path', { d: 'M6 12l4-4 4 4 4-4' }),
-              ]
-            }),
-            onSelect: function() {
-              var toggle = window.__pluginToggles && window.__pluginToggles['token-usage-stats']
-              if (toggle) toggle()
-            }
-          }
-        ]
+          ].filter(function(e) { return toggles[e.id] })
+
+          return jsx('div', {
+            className: 'p-1 flex flex-col gap-0.5',
+            children: entries.map(function(e) {
+              return jsx('button', {
+                key: e.id,
+                type: 'button',
+                onClick: function() {
+                  var toggle = toggles[e.id]
+                  if (toggle) toggle()
+                  close()
+                },
+                className: 'flex items-center gap-2 w-full rounded-md px-2 py-1.5 text-sm text-(--ui-text-primary) hover:bg-(--chrome-action-hover) transition-colors cursor-pointer border-none text-left',
+                children: [
+                  jsx('span', { className: 'shrink-0 text-(--ui-text-secondary)', children: e.icon }),
+                  jsx('span', { children: e.label })
+                ]
+              })
+            })
+          })
+        }
       }
     })
   }
