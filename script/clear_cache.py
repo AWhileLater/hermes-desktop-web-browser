@@ -13,11 +13,27 @@ remaining files are deleted. Prints one short JSON line for the plugin.
 import json
 import os
 import shutil
+import sys
 
-BASE = os.path.join(os.environ.get("APPDATA", ""), "hermes", "Partitions", "hermes-browser")
-if not os.path.isdir(BASE):
-    # Fallback: derive Roaming from the home dir when APPDATA is missing.
-    BASE = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "hermes", "Partitions", "hermes-browser")
+
+def resolve_base():
+    """Electron partition cache root, per platform.
+
+    Windows: %APPDATA%/hermes/Partitions/<partition>
+    macOS:   ~/Library/Application Support/hermes/Partitions/<partition>
+    Linux:   $XDG_CONFIG_HOME/hermes/Partitions/<partition> (default ~/.config)
+    """
+    if sys.platform == "win32":
+        return os.path.join(os.environ.get("APPDATA", ""), "hermes", "Partitions", "hermes-browser")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/hermes/Partitions/hermes-browser")
+    return os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+        "hermes", "Partitions", "hermes-browser",
+    )
+
+
+BASE = resolve_base()
 
 # Pure cache directories only — cookies / IndexedDB / Local Storage stay.
 TARGETS = ["Cache", "Code Cache", "GPUCache", "DawnGraphiteCache", "DawnWebGPUCache"]
@@ -42,8 +58,19 @@ def clear_dir_contents(path):
     return "cleared"
 
 
-results = {}
-for name in TARGETS:
-    results[name] = clear_dir_contents(os.path.join(BASE, name))
+def main():
+    results = {}
+    for name in TARGETS:
+        results[name] = clear_dir_contents(os.path.join(BASE, name))
 
-print(json.dumps({"ok": True, "base": BASE, "results": results}, ensure_ascii=False))
+    # 找不到缓存目录（平台路径解析错误 / 分区未创建）时明确报失败，
+    # 避免"已清理"的假成功——插件侧据此显示失败 toast。
+    if not os.path.isdir(BASE) or not any(v == "cleared" for v in results.values()):
+        print(json.dumps({"ok": False, "error": "no cache directory found", "base": BASE, "results": results}, ensure_ascii=False))
+        raise SystemExit(1)
+
+    print(json.dumps({"ok": True, "base": BASE, "results": results}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
