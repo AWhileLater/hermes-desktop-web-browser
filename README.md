@@ -80,7 +80,7 @@ After either method, reload plugins by running **Reload desktop plugins** from t
 
 ## Usage
 
-1. Click the globe icon in the Hermes Desktop status bar, or press `Ctrl+Shift+B` to open the browser panel
+1. Click the globe icon in the Hermes Desktop status bar to open the browser panel
 2. Type a URL in the address bar and press Enter
 3. Use the toolbar buttons for back/forward/refresh; right-click a tab for close/reload/copy URL
 4. Click the star to bookmark the current page

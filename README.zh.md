@@ -80,7 +80,7 @@ cp -r hermes-desktop-web-browser ~/.hermes/desktop-plugins/hermes-desktop-web-br
 
 ## 使用说明
 
-1. 点击 Hermes Desktop 状态栏中的地球图标，或按下 `Ctrl+Shift+B` 打开浏览器面板
+1. 点击 Hermes Desktop 状态栏中的地球图标打开浏览器面板
 2. 在地址栏输入 URL 并回车
 3. 使用工具栏按钮进行后退/前进/刷新；右键标签页可关闭/重载/复制 URL
 4. 点击星标将当前页面加入收藏夹
