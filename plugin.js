@@ -97,6 +97,9 @@ var STYLE_TEXT = [
 '.wa-region{position:fixed;pointer-events:none;border:2px solid #ff3b30;background:rgba(255,59,48,0.08);border-radius:3px;z-index:2147483645;box-sizing:border-box}',
 '.wa-bubble{position:fixed;z-index:2147483647;min-width:22px;height:22px;padding:0 7px;display:flex;align-items:center;justify-content:center;background:#ff3b30;color:#fff;font:700 12px/1 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;border-radius:11px;box-shadow:0 2px 6px rgba(0,0,0,0.3);pointer-events:none;white-space:nowrap}',
 '#wa-input-popover{position:fixed;z-index:2147483647;width:260px;background:#2c2c2e;border:1px solid #3a3a3c;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,0.5);padding:10px;font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;color:#f5f5f7}',
+'#wa-input-popover .wa-drag-handle{height:14px;margin:-10px -10px 6px;border-radius:9px 9px 0 0;display:flex;align-items:center;justify-content:center;background:#3a3a3c;cursor:grab !important;user-select:none;-webkit-user-select:none;touch-action:none}',
+'#wa-input-popover .wa-drag-handle:active{cursor:grabbing !important}',
+'#wa-input-popover .wa-drag-grip{width:36px;height:4px;border-radius:2px;background:rgba(245,245,247,0.35)}',
 '#wa-input-popover .wa-quick-tags{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}',
 '#wa-input-popover .wa-quick-tag{padding:3px 8px;border-radius:6px;font-size:11px;cursor:pointer;border:1px solid #3a3a3c;background:#3a3a3c;color:#f5f5f7;white-space:nowrap}',
 '#wa-input-popover textarea{width:100%;min-height:64px;resize:vertical;border:1px solid #3a3a3c;border-radius:7px;padding:7px 8px;font-size:13px;line-height:1.4;outline:none;box-sizing:border-box;background:#1c1c1e;color:#f5f5f7;font-family:inherit}',
@@ -290,6 +293,7 @@ function openPopover(el, clientX, clientY) {
   popover = document.createElement('div');
   popover.id = 'wa-input-popover';
   popover.innerHTML =
+    '<div class="wa-drag-handle"><span class="wa-drag-grip"></span></div>' +
     '<div class="wa-quick-tags" style="display:' + (QUICK_TAGS ? '' : 'none') + '">' +
     '<span class="wa-quick-tag" data-tag="' + T.quickTagBug + '">' + T.quickTagBug + '</span>' +
     '<span class="wa-quick-tag" data-tag="' + T.quickTagStyle + '">' + T.quickTagStyle + '</span>' +
@@ -332,6 +336,36 @@ function openPopover(el, clientX, clientY) {
   var ok = popover.querySelector('.wa-ok');
   var cancel = popover.querySelector('.wa-cancel');
   cancel.addEventListener('click', closePopover);
+  // 拖动把手：按住顶部把手拖到任意位置（clamp 在视口内，边界留 4px）
+  var handle = popover.querySelector('.wa-drag-handle');
+  var dragState = null;
+  handle.addEventListener('pointerdown', function (e) {
+    if (e.button !== 0) return;
+    var r = popover.getBoundingClientRect();
+    dragState = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+    try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+    e.preventDefault();
+  });
+  handle.addEventListener('pointermove', function (e) {
+    if (!dragState) return;
+    var x = e.clientX - dragState.dx;
+    var y = e.clientY - dragState.dy;
+    var pw = popover.offsetWidth || 280;
+    var ph = popover.offsetHeight || 280;
+    x = Math.max(4, Math.min(window.innerWidth - pw - 4, x));
+    y = Math.max(4, Math.min(window.innerHeight - ph - 4, y));
+    popover.style.left = x + 'px';
+    popover.style.top = y + 'px';
+  });
+  function endDrag(e) {
+    if (!dragState) return;
+    dragState = null;
+    if (handle.hasPointerCapture && handle.hasPointerCapture(e.pointerId)) {
+      handle.releasePointerCapture(e.pointerId);
+    }
+  }
+  handle.addEventListener('pointerup', endDrag);
+  handle.addEventListener('pointercancel', endDrag);
   ok.addEventListener('click', function () {
     var note = sanitizeNote(tx.value);
     if (note) {
