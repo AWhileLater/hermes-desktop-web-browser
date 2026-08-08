@@ -1078,8 +1078,9 @@ function TabWebview({ tab, isActive, onNavigate, onInPageNavigate, onTitleChange
   // tab.url → navUrl 同步（webview src 目标）：
   // - 用户主动导航（地址栏输入/新开/刷新）→ tab.url 变化 → 更新 navUrl → src 变化 → 加载
   // - did-navigate 完成的 URL 同步 → navSyncRef 标记 → 跳过（src 不变，webview 已自行导航）
+  // - tab.url 置空（最后一个 tab 关闭重置为新标签页）→ 同步 navUrl='' → src 回落欢迎页；
+  //   之前 `if (!tab.url) return` 阻止空串同步，navUrl 残留旧 URL → 页面内容不变（关闭无效 bug）
   useEffect(() => {
-    if (!tab.url) return
     if (navSyncRef.current) {
       navSyncRef.current = false
       return
@@ -1095,7 +1096,7 @@ function TabWebview({ tab, isActive, onNavigate, onInPageNavigate, onTitleChange
       webviewReadyRef.current = true
       console.log('[browser] EVT dom-ready')
       // 通知父级 ready（标注轮询等高频调用跳过未就绪 webview）
-      if (isActiveRef.current) onWebviewRef(wv, true)
+      if (isActiveRef.current) onWebviewRef(tab.id, wv, true)
     }
     wv.addEventListener('dom-ready', onDomReady)
     // 主动探测：dom-ready 事件可能在监听器绑定前已触发（React 渲染时序），
@@ -1106,7 +1107,7 @@ function TabWebview({ tab, isActive, onNavigate, onInPageNavigate, onTitleChange
         if (!webviewReadyRef.current) {
           webviewReadyRef.current = true
           console.log('[browser] webview ready (probe)')
-          if (isActiveRef.current) onWebviewRef(wv, true)
+          if (isActiveRef.current) onWebviewRef(tab.id, wv, true)
         }
       }).catch(() => {})
     } catch (e) {}
@@ -1117,7 +1118,7 @@ function TabWebview({ tab, isActive, onNavigate, onInPageNavigate, onTitleChange
       // 必须同步通知父级 ready=false，否则父级标注轮询/命令会用旧 ready=true 调
       // 用已失效的 webview 实例 → "must be attached to the DOM" 报错。
       webviewReadyRef.current = false
-      if (isActiveRef.current) onWebviewRef(wv, false)
+      if (isActiveRef.current) onWebviewRef(tab.id, wv, false)
       navStartedRef.current = true
       // 链接导航（用户点击链接/表单提交，will-navigate 已标记）→ 不开遮罩：
       // MPA 整页导航加载快、白屏极短，遮罩会让每次点击都闪一下，比白屏更突兀。
@@ -1166,8 +1167,14 @@ function TabWebview({ tab, isActive, onNavigate, onInPageNavigate, onTitleChange
       if (!wv || !webviewReadyRef.current || typeof wv.isLoading !== 'function') return
       try {
         const r = wv.isLoading()
-        if (r && typeof r.then === 'function') r.then(setLoadingSafe).catch(() => {})
-        else setLoadingSafe(!!r)
+        // 轮询只兜底「关闭」loading（did-stop-loading 事件漏触发时纠正）：
+        // isLoading() 返回 true 时不置 loading——SPA 路由/页面异步资源会让
+        // isLoading() 短暂/持续为 true，若同步到 loadingMap，刷新按钮会被误判为
+        // 「加载中」，点击变成 stopTabLoad（停止加载）而不是刷新（点两次才刷新的根因）。
+        // 真正的「打开 loading」只由 did-start-loading 事件驱动。
+        const markIdle = (v) => { if (!v) setLoadingSafe(false) }
+        if (r && typeof r.then === 'function') r.then(markIdle).catch(() => {})
+        else if (!r) setLoadingSafe(false)
       } catch (e) {}
     }, 500)
     return () => clearInterval(timer)
@@ -1178,10 +1185,10 @@ function TabWebview({ tab, isActive, onNavigate, onInPageNavigate, onTitleChange
   // 避免 executeJavaScript 同步抛错刷屏
   useEffect(() => {
     if (isActive && webviewRef.current) {
-      onWebviewRef(webviewRef.current, webviewReadyRef.current)
+      onWebviewRef(tab.id, webviewRef.current, webviewReadyRef.current)
     }
-    return () => { if (isActive) onWebviewRef(null, false) }
-  }, [isActive, onWebviewRef])
+    return () => { if (isActive) onWebviewRef(tab.id, null, false) }
+  }, [isActive, onWebviewRef, tab.id])
 
   // 监听页面 console → 仅解析 __BROWSER_UI__（页面点击上报/外链打开）。
   // 标注引擎消息已改走「队列 + 轮询拉取」（buildPollScript），不再经 console——console 可被页面劫持。
@@ -1474,7 +1481,11 @@ function TabWebview({ tab, isActive, onNavigate, onInPageNavigate, onTitleChange
     navStartedRef.current = false
     // 标记：此次 tab.url 更新来自 did-navigate 同步，navUrl（src）保持不跳变，
     // 避免 Electron 对 src 属性变化重新 loadURL → MPA 导航完成后二次加载闪屏。
-    navSyncRef.current = true
+    // 仅当 tab.url 会实际变化（effect 会运行）时设置：值相同则 effect 不运行，
+    // 残留标记会被下次刷新中间态误消费 → 点两次才刷新。
+    if (tab.url !== url) {
+      navSyncRef.current = true
+    }
     setLoadingSafe(false)
     clearLoadError()
     onNavigate(tab.id, url)
@@ -1945,6 +1956,9 @@ function BrowserPane({ storage }) {
   // 当前真实地址——did-navigate 与 did-navigate-in-page 都实时同步到这个 ref。
   // 修复：Streamlit 等多页 SPA 内导航后点刷新，reloadTab 之前用过期 tab.url 跳回旧页面。
   const realUrlRef = useRef({})
+  // 各 tab 的 webview 实例（reloadTab 直接调 webview.reload() 用；激活 tab 的实例
+  // 另存 activeWebviewRef 供标注/截图）
+  const tabWebviewsRef = useRef({})
 
   // ── 标注个性化配置（持久化到 ctx.storage）──
   const [annoPasteWithImage, setAnnoPasteWithImage] = useState(() => storage.get('annoPasteWithImage', true))
@@ -2016,10 +2030,17 @@ function BrowserPane({ storage }) {
   // 未 ready 时 executeJavaScript 同步抛错（"must be attached to the DOM"），
   // 标注轮询 800ms 高频调用会把 Uncaught 刷屏——用此标志跳过未就绪的 webview。
   const webviewReadyRef = useRef(false)
-  const handleWebviewRef = useCallback((wv, ready) => {
-    activeWebviewRef.current = wv
-    webviewReadyRef.current = !!ready
-  }, [])
+  const handleWebviewRef = useCallback((tabId, wv, ready) => {
+    // 各 tab webview 实例注册（刷新等按 tab 直接调用）。
+    // 实例注销交给 closeTab（tab 关闭）；wv=null 只用于清理激活 tab 的引用/ready——
+    // 切换 tab 时旧实例只是隐藏（仍挂载在 DOM），reload() 仍可用，不必注销。
+    if (wv) tabWebviewsRef.current[tabId] = wv
+    // 激活 tab 的引用与 ready 标志（标注命令/截图用）
+    if (tabId === activeTabId) {
+      activeWebviewRef.current = wv
+      webviewReadyRef.current = !!ready
+    }
+  }, [activeTabId])
   // 标注命令统一入口：执行前探测 webview 是否可调用（未 attach/未 dom-ready 时
   // executeJavaScript 同步抛错）。ready 缓存可能过期（webview 重建/导航中），
   // 因此这里不信任缓存，用 try 探测兜底——同步抛错被捕获即为不可用。
@@ -2337,6 +2358,7 @@ function BrowserPane({ storage }) {
     setAnnoActiveByTab((prev) => { const next = { ...prev }; delete next[tabId]; return next })
     delete secretsRef.current[tabId]
     delete realUrlRef.current[tabId]
+    delete tabWebviewsRef.current[tabId]
     setHistory((prev) => { const next = { ...prev }; delete next[tabId]; return next })
     setLoadingMap((prev) => { const next = { ...prev }; delete next[tabId]; return next })
     const idx = tabs.findIndex((t) => t.id === tabId)
@@ -2378,7 +2400,14 @@ function BrowserPane({ storage }) {
 
   // ── 重新加载当前 tab ──
   const reloadTab = useCallback((tabId) => {
-    // 切换到目标 tab 的 URL 重新设置以触发刷新
+    // 优先直接调 webview.reload()：原生整页刷新，不经过 tab.url→navUrl 的 src 切换。
+    // src 切换方案有 navSyncRef 残留缺陷：did-navigate 设置标记后若 tab.url 值未变
+    // （effect 不运行）标记残留，下次刷新中间态被误消费 → 第一次点击无效（点两次才刷新）。
+    const wv = tabWebviewsRef.current[tabId]
+    if (wv && typeof wv.reload === 'function') {
+      try { wv.reload(); return } catch (e) {}
+    }
+    // 兜底：webview 未注册（如 tab 刚创建未就绪）走旧逻辑
     const tab = tabs.find((t) => t.id === tabId)
     if (!tab) return
     // 刷新目标用「最新真实 URL」（含 SPA 路由后的地址）而非 tab.url：
