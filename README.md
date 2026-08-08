@@ -16,6 +16,8 @@ A **Hermes Desktop Plugin** that embeds a webview browser pane into your workspa
 
 A visual annotation → auto-edit workflow: mark any element on a page, send the annotation to your AI agent, and the agent locates the corresponding code and applies your change -- whether it is a bug fix, a style adjustment, a layout tweak, or a new feature. You only describe what to change; no need to say where or how.
 
+The annotation feature is adapted from the Chrome extension [Annotator](https://github.com/AWhileLater/annotator), ported and deeply integrated into Hermes Desktop: per-tab independent annotations, one-click paste into the chat, and hardened injection security.
+
 ### How it works
 
 1. Click the pen button in the toolbar to enter annotation mode
@@ -44,7 +46,7 @@ The annotation panel lists all annotations with edit / delete / clear. Each anno
 
 ### Settings
 
-- **Include screenshot when copying** -- on by default; the screenshot provides auxiliary location cues (helps the agent confirm the target element visually). Turn it off if your model does not support vision (image analysis): no screenshot is taken and the prompt omits screenshot hints. Element location does not rely on vision -- the annotation's selector / domPath / text are enough for the agent to find it.
+- **Enable screenshots** -- on by default; the screenshot provides auxiliary location cues (helps the agent confirm the target element visually). Turn it off if your model does not support vision (image analysis): no screenshot is taken and the prompt omits screenshot hints. Element location does not rely on vision -- the annotation's selector / domPath / text are enough for the agent to find it.
 - **Quick annotation tags** -- when off, the tag row is hidden in the note popover
 
 ### Under the hood

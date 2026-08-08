@@ -10,7 +10,7 @@
 
 import { jsx } from 'react/jsx-runtime'
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
-import { icons, atom, usePluginI18n, useI18n, Switch, host } from '@hermes/plugin-sdk'
+import { icons, atom, usePluginI18n, useI18n, Switch } from '@hermes/plugin-sdk'
 
 
 // =============================================================================
@@ -21,7 +21,8 @@ import { icons, atom, usePluginI18n, useI18n, Switch, host } from '@hermes/plugi
  *
  * 从 Chrome 扩展版 annotator（content.js + format.js + content.css）移植，
  * 通信层改为 webview 协议：
- *   - 页面 → 插件：console.log('__ANNO__' + JSON.stringify(msg))
+ *   - 页面 → 插件：引擎内部消息队列 + 插件轮询拉取（buildPollScript 调 __poll(secret)），
+ *     不再用 console.log——console 可被页面劫持窃取密钥/伪造消息
  *   - 插件 → 页面：window.__annotator.* API（经 executeJavaScript 调用）
  *
  * 生成方式：外层模板字符串 + __I18N__ 占位符（JSON.stringify 注入），
@@ -79,6 +80,11 @@ const ENGINE_TEMPLATE = `(function(){
 var T = __I18N__;
 var QUICK_TAGS = __QUICK_TAGS__;
 var SECRET = __SECRET__;
+// 消息队列：引擎 → 插件改用「队列 + 插件轮询拉取」，不再经 console.log。
+// console.log 通道可被页面劫持窃取密钥/伪造消息；队列在引擎闭包内，页面无法写入。
+var msgQueue = [];
+// 队列上限：引擎异常反复上报时防止内存膨胀（正常标注远达不到）
+var MSG_QUEUE_MAX = 200;
 
 // ===== 注入样式 =====
 var STYLE_TEXT = [
@@ -116,12 +122,26 @@ var pendingEl = null;
 
 // ===== 通信 =====
 function snd(type, data) {
-  try { console.log('__ANNO__' + JSON.stringify(Object.assign({ type: type, _s: SECRET }, data || {}))); } catch (e) {}
+  try {
+    msgQueue.push(Object.assign({ type: type, _s: SECRET }, data || {}));
+    if (msgQueue.length > MSG_QUEUE_MAX) msgQueue.shift();
+  } catch (e) {}
 }
 
 // ===== 纯函数（format.js 移植）=====
 function oneLine(s) {
   return String(s == null ? '' : s).replace(/[\\r\\n\\t]+/g, ' ').replace(/\\s+/g, ' ').trim();
+}
+// 标注文本清洗：单行化 + 去控制字符 + 截断（写入与输出两侧使用）
+function sanitizeNote(n) {
+  var s = String(n == null ? '' : n).replace(/[\\r\\n\\t]+/g, ' ').replace(/\\s+/g, ' ').trim();
+  s = s.replace(/[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]/g, '');
+  if (s.length > 500) s = s.slice(0, 500);
+  return s;
+}
+// 输出引号包裹 + 内部引号转义：防止 note 内容伪造 prompt 结构条目
+function quoteNote(n) {
+  return '"' + sanitizeNote(n).replace(/"/g, '\\"') + '"';
 }
 function nextIndex() {
   var mx = 0;
@@ -183,7 +203,7 @@ function formatPrompt(lang, withImage) {
   for (var i = 0; i < annotations.length; i++) {
     var a = annotations[i];
     L.push('Annotation ' + a.index);
-    L.push('  Comment : ' + oneLine(a.note));
+    L.push('  Comment : ' + quoteNote(a.note));
     if (a.selector) L.push('  selector: ' + oneLine(a.selector));
     if (a.domPath) L.push('  domPath : ' + oneLine(a.domPath));
     if (a.targetText) L.push('  text    : ' + oneLine(a.targetText));
@@ -313,7 +333,7 @@ function openPopover(el, clientX, clientY) {
   var cancel = popover.querySelector('.wa-cancel');
   cancel.addEventListener('click', closePopover);
   ok.addEventListener('click', function () {
-    var note = tx.value.trim();
+    var note = sanitizeNote(tx.value);
     if (note) {
       addAnnotation(pendingEl, note);
       closePopover();
@@ -550,7 +570,7 @@ window.__annotator = {
     if (secret !== SECRET) return { ok: false };
     var a = annotations.find(function (x) { return x.index === idx; });
     if (!a) return { ok: false };
-    a.note = note;
+    a.note = sanitizeNote(note);
     snd('ANNOTATION_UPDATED', { annotations: annotations });
     return { ok: true };
   },
@@ -558,6 +578,13 @@ window.__annotator = {
     try { return JSON.parse(JSON.stringify(annotations)); } catch (e) { return []; }
   },
   verifySecret: function (s) { return s === SECRET; },
+  // 轮询拉取通道：返回并清空消息队列（密钥不匹配返回 null——页面无法伪造合法消息）
+  __poll: function (secret) {
+    if (secret !== SECRET) return null;
+    var msgs = msgQueue;
+    msgQueue = [];
+    return { active: active, count: annotations.length, msgs: msgs };
+  },
   isActive: function () { return active; },
   getState: function () {
     return {
@@ -591,11 +618,13 @@ snd('ENGINE_READY');
 export function buildAnnotationEngineScript(lang, quickTags, secret) {
   const dict = lang === 'en' ? I18N.en : I18N.zh
   const qt = quickTags === undefined ? true : !!quickTags
+  // 用 split/join 做字面量替换：String.replace 的 replacement 会把 $ 当特殊模式（如 $&、$'、$$、$n），
+  // 文案/密钥里出现 $ 会静默损坏注入脚本。
   return ENGINE_TEMPLATE
-    .replace('__I18N__', JSON.stringify(dict))
-    .replace('__QUICK_TAGS__', qt ? 'true' : 'false')
-    .replace('__EN_I18N__', JSON.stringify(I18N.en))
-    .replace('__SECRET__', JSON.stringify(secret || ''))
+    .split('__I18N__').join(JSON.stringify(dict))
+    .split('__QUICK_TAGS__').join(qt ? 'true' : 'false')
+    .split('__EN_I18N__').join(JSON.stringify(I18N.en))
+    .split('__SECRET__').join(JSON.stringify(secret || ''))
 }
 
 /** 检查引擎是否已注入（需验证密钥匹配——防止网页预置假引擎骗过检查） */
@@ -604,11 +633,13 @@ export function buildEngineCheckScript(secret) {
   return '(function(){return !!(window.__annotator && typeof window.__annotator.verifySecret === "function" && window.__annotator.verifySecret(' + JSON.stringify(s) + '));})()'
 }
 
-/** 拉取当前引擎状态（轮询通道用）——只读开关/数量用于 UI 同步，
- *  标注数据一律来自带令牌的引擎消息，不信任页面返回的数组
- *  （页面可覆盖 getState 伪造数据）。 */
-export function buildStatePollScript() {
-  return '(function(){try{var s=window.__annotator?window.__annotator.getState():null;return s?{active:!!s.active,count:Number(s.count)||0}:null;}catch(e){return null;}})()'
+/** 拉取当前引擎状态 + 消息队列（轮询通道）——active/count 用于 UI 同步，
+ *  msgs 为引擎闭包队列（带 _s 令牌，页面无法写入/伪造）；
+ *  插件侧仍按 _s 校验每条消息，不信任页面返回的数组。
+ *  （页面可覆盖 getState/__poll 伪造——密钥不匹配即返回空，注入时 check 会发现并重注。） */
+export function buildPollScript(secret) {
+  const s = secret || engineSecret
+  return '(function(){try{var out={active:false,count:0,msgs:[]};var a=window.__annotator;if(a&&typeof a.__poll==="function"){var r=a.__poll(' + JSON.stringify(s) + ');if(r){out.active=!!r.active;out.count=Number(r.count)||0;if(Array.isArray(r.msgs))out.msgs=r.msgs;}}return out;}catch(e){return null;}})()'
 }
 
 // ── 标注引擎注入密钥 ──
@@ -632,6 +663,17 @@ engineSecret = genEngineSecret()
 function oneLine(s) {
   return String(s == null ? '' : s).replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim()
 }
+// 标注文本清洗（与引擎模板内 sanitizeNote 同一逻辑）：单行化 + 去控制字符 + 截断
+function sanitizeNote(n) {
+  let s = String(n == null ? '' : n).replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim()
+  s = s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+  if (s.length > 500) s = s.slice(0, 500)
+  return s
+}
+// 输出引号包裹 + 内部引号转义：防止 note 内容伪造 prompt 结构条目（如 "Annotation 2"、"WEB ANNOTATIONS"）
+function quoteNote(n) {
+  return '"' + sanitizeNote(n).replace(/"/g, '\\"') + '"'
+}
 
 function formatAnnotationsPrompt(annotations, lang, withImage) {
   lang = lang === 'en' ? 'en' : 'zh'
@@ -651,7 +693,7 @@ function formatAnnotationsPrompt(annotations, lang, withImage) {
   for (let i = 0; i < list.length; i++) {
     const a = list[i]
     L.push('Annotation ' + a.index)
-    L.push('  Comment : ' + oneLine(a.note))
+    L.push('  Comment : ' + quoteNote(a.note))
     if (a.selector) L.push('  selector: ' + oneLine(a.selector))
     if (a.domPath) L.push('  domPath : ' + oneLine(a.domPath))
     if (a.targetText) L.push('  text    : ' + oneLine(a.targetText))
@@ -839,28 +881,6 @@ function hostname(url) {
 let tabIdCounter = 0
 function nextTabId() { return ++tabIdCounter }
 
-// 新 Tab 拦截脚本
-const NEW_TAB_INTERCEPT_SCRIPT = `
-(function() {
-  if (window.__annotatorIntercepted) return;
-  window.__annotatorIntercepted = true;
-  document.addEventListener('click', function(e) {
-    var a = e.target.closest('a');
-    if (a && a.target === '_blank' && a.href) {
-      e.preventDefault();
-      e.stopPropagation();
-      document.documentElement.setAttribute('data-pending-new-tab', a.href);
-    }
-  }, true);
-  window.open = function(url) {
-    if (url) {
-      document.documentElement.setAttribute('data-pending-new-tab', url);
-    }
-    return null;
-  };
-})()
-`
-
 // ---------------------------------------------------------------------------
 // 收藏夹下拉菜单
 // ---------------------------------------------------------------------------
@@ -962,10 +982,28 @@ const UI_CLICK_BRIDGE_SCRIPT = `(function() {
   return { ready: true };
 })()`
 
-function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest, reinjectFlag, onAnnoEvent, onAnnoReset, onSecretChange, onWebviewRef, welcomeUrl, onLoadingChange, onPageClick, annoQuickTags, annoActive, onAnnoStop }) {
+function TabWebview({ tab, isActive, onNavigate, onInPageNavigate, onTitleChange, onNewTabRequest, secretsRef, onAnnoReset, onSecretChange, onWebviewRef, welcomeUrl, webviewBg, onLoadingChange, onPageClick, annoQuickTags, annoActive, onAnnoStop }) {
   const webviewRef = useRef(null)
-  // 本 tab 引擎注入时生成的密钥（注入检查 / 父级消息校验用，per-tab 互不影响）
-  const secretRef = useRef('')
+  // 实际加载目标 URL（webview src 用）：只在「用户主动导航」时更新，
+  // did-navigate 完成的 URL 同步不更新（避免 src 变化触发二次 loadURL）。
+  const [navUrl, setNavUrl] = useState('')
+  // did-navigate 同步标记：handleDidNavigate 更新 tab.url 时置 true，
+  // 对应 tab.url→navUrl 的同步 effect 检测到该标记则跳过（不触发 src 变化）。
+  const navSyncRef = useRef(false)
+  // webview 是否已 attach 到 DOM 且发出 dom-ready。在 ready 之前调用 executeJavaScript /
+  // isLoading / getURL 等方法会抛 "The WebView must be attached to the DOM..." 错误
+  // （poll 轮询每 500ms 无条件调用会刷屏报错并导致注入失败）。dom-ready 事件置 true。
+  const webviewReadyRef = useRef(false)
+  // 链接导航标记：will-navigate（用户点击链接/表单提交等发起的导航）置 true。
+  // did-start-loading 时若为 true → 不开启遮罩（MPA 整页导航加载快、白屏极短，
+  // 遮罩会让每次点击都闪一下）；刷新/新开/初次加载（无 will-navigate）才开遮罩盖白屏。
+  const linkNavRef = useRef(false)
+  // 最新 isActive 镜像（供事件闭包读取——useEffect 闭包捕获首次渲染的 isActive，
+  // 后台 tab 激活前 dom-ready 已触发时上抛会被过期值拦截，导致父级 ready 永远 false）
+  const isActiveRef = useRef(isActive)
+  isActiveRef.current = isActive
+  // 引擎密钥统一存父级 secretsRef（per-tab 权威）：注入与按需注入（toggleAnnotationMode）共用一份，
+  // 避免本地 ref 与父级不同步导致 check 用旧密钥反复重注。
   const t = usePluginI18n('hermes-desktop-web-browser')
   // 引擎语言跟随 Hermes 桌面语言（引擎只支持 zh/en，其他一律 en）
   const { locale } = useI18n()
@@ -974,16 +1012,28 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
   // ── 加载状态（did-start/stop-loading 事件 + isLoading() 轮询兜底）──
   // 本地无需渲染 loading，直接上抛给父级（刷新按钮旋转动画用）
   const loadingRef = useRef(false)
-  const setLoadingSafe = useCallback((v) => {
+  // 真实整页导航标志：did-start-loading 置 true，did-stop-loading 置 false。
+  // 用于区分「真实整页导航」与「SPA 路由的 did-navigate 误报」——Electron webview
+  // 在 pushState（SPA 路由）时也会触发 did-navigate，若此时更新 tab.url 会引发
+  // React 改 src → 整页重载（滚动条复位、标注被清空）。仅真实加载后才更新 tab.url。
+  const navStartedRef = useRef(false)
+  // 加载中主题色遮罩：webview guest 页面加载前默认白底，用同色遮罩盖住避免白屏闪烁。
+  // 遮罩只在「整页导航事件」时开启（mask=true）；isLoading() 轮询的短暂 true（SPA 路由
+  // 加载异步 chunk）不触发遮罩——否则每次页面内跳转都会盖一下，像整页刷新。轮询仅兜底关闭。
+  const [bgVisible, setBgVisible] = useState(true)
+  const setLoadingSafe = useCallback((v, opts) => {
+    const { mask = false } = opts || {}
     if (loadingRef.current === !!v) return
     loadingRef.current = !!v
+    // 开启遮罩需显式 mask；关闭遮罩总是允许（事件漏触发时轮询兜底关掉）
+    if (mask || !v) setBgVisible(!!v)
     onLoadingChange(tab.id, !!v)
   }, [onLoadingChange, tab.id])
 
   // 兜底读取页面标题（page-title-updated 事件在部分环境下不触发/字段不同）
   const refreshTitle = useCallback(() => {
     const wv = webviewRef.current
-    if (!wv || IS_WELCOME(tab.url)) return
+    if (!wv || !webviewReadyRef.current || IS_WELCOME(tab.url)) return
     try {
       wv.executeJavaScript('document.title').then((title) => {
         if (typeof title === 'string' && title.trim()) onTitleChange(tab.id, title.trim())
@@ -991,19 +1041,66 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
     } catch (e) {}
   }, [tab.id, tab.url, onTitleChange])
 
+  // tab.url → navUrl 同步（webview src 目标）：
+  // - 用户主动导航（地址栏输入/新开/刷新）→ tab.url 变化 → 更新 navUrl → src 变化 → 加载
+  // - did-navigate 完成的 URL 同步 → navSyncRef 标记 → 跳过（src 不变，webview 已自行导航）
+  useEffect(() => {
+    if (!tab.url) return
+    if (navSyncRef.current) {
+      navSyncRef.current = false
+      return
+    }
+    setNavUrl(tab.url)
+  }, [tab.url])
+
   useEffect(() => {
     const wv = webviewRef.current
     if (!wv) return
+    // dom-ready：webview 已 attach 且可安全调用方法（executeJavaScript 等）
+    const onDomReady = () => {
+      webviewReadyRef.current = true
+      console.log('[browser] EVT dom-ready')
+      // 通知父级 ready（标注轮询等高频调用跳过未就绪 webview）
+      if (isActiveRef.current) onWebviewRef(wv, true)
+    }
+    wv.addEventListener('dom-ready', onDomReady)
+    // 主动探测：dom-ready 事件可能在监听器绑定前已触发（React 渲染时序），
+    // 此时 webview 实际已可用但 ready 标志为 false → 注入/轮询被守卫拦死。
+    // 用一次无害的 executeJavaScript 探测，成功则视为 ready。
+    try {
+      wv.executeJavaScript('1').then(() => {
+        if (!webviewReadyRef.current) {
+          webviewReadyRef.current = true
+          console.log('[browser] webview ready (probe)')
+          if (isActiveRef.current) onWebviewRef(wv, true)
+        }
+      }).catch(() => {})
+    } catch (e) {}
     const onStart = () => {
-      setLoadingSafe(true)
+      // 整页导航开始（刷新/新开/初次加载）：开启主题色遮罩盖住 guest 白底
+      console.log('[browser] EVT did-start-loading', JSON.stringify({ url: (() => { try { return webviewRef.current ? webviewRef.current.getURL() : '' } catch (e) { return '' } })() }))
+      // 新导航开始 → webview 重新进入未 ready 状态（dom-ready 前方法不可调用）。
+      // 必须同步通知父级 ready=false，否则父级标注轮询/命令会用旧 ready=true 调
+      // 用已失效的 webview 实例 → "must be attached to the DOM" 报错。
+      webviewReadyRef.current = false
+      if (isActiveRef.current) onWebviewRef(wv, false)
+      navStartedRef.current = true
+      // 链接导航（用户点击链接/表单提交，will-navigate 已标记）→ 不开遮罩：
+      // MPA 整页导航加载快、白屏极短，遮罩会让每次点击都闪一下，比白屏更突兀。
+      // 刷新/新开/初次加载（无 will-navigate）→ 开遮罩盖白屏防闪烁。
+      const isLinkNav = linkNavRef.current
+      linkNavRef.current = false
+      setLoadingSafe(true, { mask: !isLinkNav })
       // 页面加载开始（刷新/导航/前进后退）：引擎随页面上下文重置（序号+边框消失），
       // 同步清空插件侧标注列表，避免残留旧页面的标注
       onAnnoReset(tab.id)
     }
     // 用 addEventListener 绑定（React 合成事件 onDidStopLoading 在此环境不可靠）：
-    // 加载完成 → 注入拦截脚本 + 刷新标题
+    // 加载完成 → 关遮罩 + 注入拦截脚本 + 刷新标题
     const onStop = () => {
-      setLoadingSafe(false)
+      console.log('[browser] EVT did-stop-loading')
+      navStartedRef.current = false
+      setLoadingSafe(false, { mask: true })
       injectInterceptScript()
       refreshTitle()
     }
@@ -1031,7 +1128,8 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
     if (!isActive) return
     const timer = setInterval(() => {
       const wv = webviewRef.current
-      if (!wv || typeof wv.isLoading !== 'function') return
+      // webview 未 attach/未 dom-ready 时调用 isLoading() 会抛错（刷屏）；跳过等待 ready
+      if (!wv || !webviewReadyRef.current || typeof wv.isLoading !== 'function') return
       try {
         const r = wv.isLoading()
         if (r && typeof r.then === 'function') r.then(setLoadingSafe).catch(() => {})
@@ -1042,27 +1140,22 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
   }, [isActive, setLoadingSafe])
 
   // 将当前激活 tab 的 webview 引用上抛给父级（标注命令 + 截图用）
+  // 附带 ready 状态：dom-ready 后置 true 并通知父级；未 ready 时父级标注轮询跳过，
+  // 避免 executeJavaScript 同步抛错刷屏
   useEffect(() => {
-    if (isActive && webviewRef.current) onWebviewRef(webviewRef.current)
-    return () => { if (isActive) onWebviewRef(null) }
+    if (isActive && webviewRef.current) {
+      onWebviewRef(webviewRef.current, webviewReadyRef.current)
+    }
+    return () => { if (isActive) onWebviewRef(null, false) }
   }, [isActive, onWebviewRef])
 
-  // 监听页面 console → 解析 __ANNO__ / __BROWSER_UI__ 通信（页面 → 插件）
+  // 监听页面 console → 仅解析 __BROWSER_UI__（页面点击上报/外链打开）。
+  // 标注引擎消息已改走「队列 + 轮询拉取」（buildPollScript），不再经 console——console 可被页面劫持。
   useEffect(() => {
     const wv = webviewRef.current
     if (!wv) return
     const handler = (e) => {
       const raw = typeof e.message === 'string' ? e.message : String(e?.message || '')
-      if (raw.startsWith('__ANNO__')) {
-        try {
-          const msg = JSON.parse(raw.slice('__ANNO__'.length))
-          // 密钥校验统一在父级完成（secretsRef 持有各 tab 注入时的密钥，避免模块级变量被后注入 tab 覆盖）
-          if (msg && msg.type) onAnnoEvent(tab.id, msg)
-        } catch (err) {
-          console.warn('[browser] bad __ANNO__ payload:', raw)
-        }
-        return
-      }
       if (raw.startsWith('__BROWSER_UI__')) {
         try {
           const msg = JSON.parse(raw.slice('__BROWSER_UI__'.length))
@@ -1079,7 +1172,7 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
     }
     wv.addEventListener('console-message', handler)
     return () => wv.removeEventListener('console-message', handler)
-  }, [onAnnoEvent, onPageClick])
+  }, [onPageClick])
 
   // 通过 DOM 事件监听新窗口请求
   useEffect(() => {
@@ -1117,6 +1210,9 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
     setLoadingSafe(false)
     if (!url || IS_WELCOME(url)) return
     if (d.isMainFrame === false) return
+    // -3 = ERR_ABORTED（导航被取消/中断：用户再次导航、重定向、页面自身中断等），
+    // 不是真正的失败——忽略，避免误显示错误页（首次打开 opencode 时会被误判失败）
+    if (code === -3) return
     // https 连接 / SSL 类错误 → 降级 http 重试一次
     if (url.startsWith('https://')) {
       const connErrors = [-101, -102, -105, -107, -109, -113, -118]
@@ -1143,7 +1239,8 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
   // 每次页面加载后注入拦截脚本
   const injectInterceptScript = useCallback(() => {
     const wv = webviewRef.current
-    if (!wv) return
+    // webview 未 ready 时 executeJavaScript 抛错——等待 dom-ready
+    if (!wv || !webviewReadyRef.current) return
     try {
       wv.executeJavaScript(`        (function() {
           if (window.__annotatorIntercepted) return { ready: true, already: true };
@@ -1168,11 +1265,12 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
             }
           }, true);
 
-          // 拦截 window.open（标注模式下不转发新 tab）
+          // 拦截 window.open（标注模式下不转发新 tab；非标注模式转发到插件新 tab）。
+          // 返回 window 占位而非 null：避免破坏依赖「打开成功返回窗口引用」的站点。
           window.open = function(url) {
             if (waActive()) return null;
             if (url) document.documentElement.setAttribute('data-pending-new-tab', url);
-            return null;
+            return window;
           };
 
           // 标注模式下吞掉 SPA 路由跳转（history API；pushState 不触发 will-navigate，只能在此兜底）
@@ -1181,25 +1279,29 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
             (function() {
               var origPush = history.pushState;
               var origReplace = history.replaceState;
-              history.pushState = function() {
+              var wrappedPush = function() {
                 if (waActive()) return;
                 return origPush.apply(this, arguments);
               };
-              history.replaceState = function() {
+              var wrappedReplace = function() {
                 if (waActive()) return;
                 return origReplace.apply(this, arguments);
               };
+              // 保持原生外观：React Router / Astro 等框架通过 toString() 检测
+              // pushState 是否原生，若被包装会放弃 SPA 路由降级为整页导航（页面
+              // 每次切换都完整刷新、滚动条复位）。伪装成原生代码可避免误判。
+              wrappedPush.toString = function() { return 'function pushState() { [native code] }'; };
+              wrappedReplace.toString = function() { return 'function replaceState() { [native code] }'; };
+              history.pushState = wrappedPush;
+              history.replaceState = wrappedReplace;
             })();
           }
 
           return { ready: true, url: location.href };
         })()
-      `).then((res) => {
-        console.log('[browser] inject result:', JSON.stringify(res))
+      `).then(() => {
         // 页面点击上报桥：菜单打开时点击页面内容可关闭（webview 事件不冒泡）
         return wv.executeJavaScript(UI_CLICK_BRIDGE_SCRIPT)
-      }).then((res) => {
-        console.log('[browser] ui click bridge:', JSON.stringify(res))
       }).catch((err) => {
         console.error('[browser] inject error:', err.message)
       })
@@ -1209,15 +1311,21 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
   }, [])
 
   // 注入标注引擎（Annotator）— 在拦截脚本之后，页面加载/切换时自动注入
+  // 幂等：注入锁（in-flight 标志）防止并发 check-then-inject 双注入；check 通过则跳过。
+  const injectInFlightRef = useRef(false)
   const injectAnnotatorEngine = useCallback(() => {
     const wv = webviewRef.current
-    if (!wv) return
+    // webview 未 ready 时 executeJavaScript 抛错（标注引擎注入失败 → 标注功能完全失效）
+    if (!wv || !webviewReadyRef.current) return
+    if (injectInFlightRef.current) return
+    injectInFlightRef.current = true
+    const finish = () => { injectInFlightRef.current = false }
     try {
-      wv.executeJavaScript(buildEngineCheckScript(secretRef.current))
+      wv.executeJavaScript(buildEngineCheckScript(secretsRef.current[tab.id] || ''))
         .then((ready) => {
           if (ready) return { already: true }
           const s = genEngineSecret()
-          secretRef.current = s
+          secretsRef.current[tab.id] = s
           onSecretChange(tab.id, s)
           const engineScript = buildAnnotationEngineScript(engineLang, annoQuickTags, s)
           const wrapped = 'try{' + engineScript + '}catch(e){console.log("__ANNO__" + JSON.stringify({type:"ENGINE_ERROR",error:String(e&&e.message||e)}))}'
@@ -1233,41 +1341,46 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
         .catch((err) => {
           console.error('[browser] annotator engine inject error:', err.message)
         })
+        .finally(finish)
     } catch (e) {
+      finish()
       console.error('[browser] annotator engine inject exception:', e)
     }
-  }, [engineLang, annoQuickTags, onSecretChange, tab.id])
+  }, [engineLang, annoQuickTags, onSecretChange, tab.id, secretsRef])
 
-  // reinjectFlag 变化时重新注入（手动按钮触发）
+  // URL 变化 / Tab 变为活跃时自动注入（替代不可靠的 webview 事件）。
+  // 合并为单个 effect：两条件任一变化即重排 1.5s 定时器，cleanup 清旧 timer，
+  // 避免「URL 变化」与「tab 激活」两个 effect 同时触发造成双注入。
   useEffect(() => {
-    if (reinjectFlag > 0) injectInterceptScript()
-  }, [reinjectFlag, injectInterceptScript])
-
-  // URL 变化时自动注入（替代不可靠的 webview 事件）
-  useEffect(() => {
+    if (!isActive) return
     if (!tab.url || tab.url === 'about:blank' || tab.url === '') return
     // 页面加载需要时间，延迟 1.5 秒后注入
     const timer = setTimeout(() => {
       injectInterceptScript()
       injectAnnotatorEngine()
+      // webview 可能尚未 dom-ready（守卫会跳过），延迟后重试注入直至成功。
+      // injectAnnotatorEngine 幂等（注入锁 + 引擎已存在检查），重试安全。
+      let tries = 0
+      const retry = setInterval(() => {
+        tries += 1
+        if (webviewReadyRef.current) {
+          injectInterceptScript()
+          injectAnnotatorEngine()
+          clearInterval(retry)
+        } else if (tries >= 10) {
+          clearInterval(retry)
+        }
+      }, 1500)
     }, 1500)
     return () => clearTimeout(timer)
-  }, [tab.url, injectInterceptScript, injectAnnotatorEngine])
-
-  // Tab 变为活跃时重新注入
-  useEffect(() => {
-    if (!isActive) return
-    const timer = setTimeout(() => {
-      injectInterceptScript()
-      injectAnnotatorEngine()
-    }, 1500)
-    return () => clearTimeout(timer)
-  }, [isActive, injectInterceptScript, injectAnnotatorEngine])
+  }, [tab.url, isActive, injectInterceptScript, injectAnnotatorEngine])
 
   // 轮询新 Tab / 导航请求（欢迎页通过 data 属性发出，webview 事件不可靠）
   const pollNewTabRequest = useCallback(() => {
     const wv = webviewRef.current
-    if (!wv) return
+    // webview 未 attach/未 dom-ready 时 executeJavaScript 会抛错（刷屏 90 条同报错）；
+    // 未 ready 直接跳过，等 dom-ready 后再轮询
+    if (!wv || !webviewReadyRef.current) return
     try {
       wv.executeJavaScript(`
         (function() {
@@ -1303,25 +1416,38 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
     return () => clearInterval(timer)
   }, [isActive, pollNewTabRequest])
 
-  // webview 事件
-  const handleDidStartLoading = useCallback(() => {}, [])
-
-  const handleDidStopLoading = useCallback(() => {
-    setLoadingSafe(false)
-    injectInterceptScript()
-    refreshTitle()
-  }, [injectInterceptScript, setLoadingSafe, refreshTitle])
+  // webview 事件（全部用 addEventListener 绑定——React 合成事件在此环境不可靠）
   const handleDidNavigate = useCallback((e) => {
-    const url = e?.detail?.url
-    if (url) {
+    // addEventListener 原生事件 url 在 e.url；React 合成事件包在 e.detail.url，兼容两者
+    const url = e?.url || e?.detail?.url
+    if (!url) return
+    // 中间态（about:blank / 欢迎页 data URL）不更新状态：刷新时 webview 会先导航到
+    // 中间页再回到目标页，若更新会把地址栏清空、历史栈混入中间 URL
+    if (IS_WELCOME(url)) {
+      if (annoActive && onAnnoStop) onAnnoStop()
+      return
+    }
+    // 真实整页导航（did-start-loading 触发过）→ 更新 tab.url
+    // SPA 路由（pushState/View Transitions）不触发 did-start-loading，did-navigate
+    // 若此时误报（无加载开始），只同步地址栏——避免更新 tab.url 引发整页重载。
+    if (!navStartedRef.current) {
+      console.log('[browser] did-navigate w/o start-loading (SPA route, addr-only):', url)
       setLoadingSafe(false)
       clearLoadError()
-      onNavigate(tab.id, url)
-      refreshTitle()
-      // 导航发生后自动退出标注模式（页面已变，旧标注/拦截不再适用于新页面）
-      if (annoActive && onAnnoStop) onAnnoStop()
+      if (onInPageNavigate) onInPageNavigate(tab.id, url)
+      return
     }
-  }, [tab.id, onNavigate, clearLoadError, setLoadingSafe, refreshTitle, annoActive, onAnnoStop])
+    navStartedRef.current = false
+    // 标记：此次 tab.url 更新来自 did-navigate 同步，navUrl（src）保持不跳变，
+    // 避免 Electron 对 src 属性变化重新 loadURL → MPA 导航完成后二次加载闪屏。
+    navSyncRef.current = true
+    setLoadingSafe(false)
+    clearLoadError()
+    onNavigate(tab.id, url)
+    refreshTitle()
+    // 导航发生后自动退出标注模式（页面已变，旧标注/拦截不再适用于新页面）
+    if (annoActive && onAnnoStop) onAnnoStop()
+  }, [tab.id, onNavigate, onInPageNavigate, clearLoadError, setLoadingSafe, refreshTitle, annoActive, onAnnoStop])
   // 标注模式下兜底拦截整页导航（will-navigate：链接跳转 / location.href / 表单提交等，
   // 由 Electron 主进程层阻止——页面 JS 层 preventDefault 拦不住的路径也能兜住）
   const handleWillNavigate = useCallback((e) => {
@@ -1333,11 +1459,50 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
       console.log('[browser] navigation blocked while annotating:', target)
     }
   }, [annoActive])
-  const handlePageTitleUpdated = useCallback((e) => {
-    // Electron webview 事件属性在 e.title（部分环境包在 e.detail 里），兼容两者
-    const title = e?.title || e?.detail?.title || ''
-    if (title) onTitleChange(tab.id, title)
-  }, [tab.id, onTitleChange])
+  // did-navigate（整页导航完成）与 will-navigate（整页导航发起前）——同样用
+  // addEventListener 绑定（React 合成事件 onDidNavigate / onWillNavigate 不可靠）
+  useEffect(() => {
+    const wv = webviewRef.current
+    if (!wv) return
+    const onNav = (e) => {
+      console.log('[browser] EVT did-navigate', JSON.stringify({ url: e?.url || e?.detail?.url || '' }))
+      handleDidNavigate(e)
+    }
+    const onWillNav = (e) => {
+      console.log('[browser] EVT will-navigate', JSON.stringify({ url: e?.url || e?.detail?.url || '' }))
+      // 链接导航标记：后续 did-start-loading 时不开启遮罩（避免 MPA 点击闪一下）。
+      // 刷新（reload）也是 will-navigate 且 URL 相同——区分：URL 与当前不同才算
+      // 「链接跳转」（刷新是原地重载，白屏明显，需要遮罩盖住）。
+      const target = e?.url || e?.detail?.url || ''
+      let current = ''
+      try { current = webviewRef.current ? webviewRef.current.getURL() : '' } catch (err) {}
+      linkNavRef.current = !!(target && current && target !== current)
+      handleWillNavigate(e)
+    }
+    wv.addEventListener('did-navigate', onNav)
+    wv.addEventListener('will-navigate', onWillNav)
+    return () => {
+      wv.removeEventListener('did-navigate', onNav)
+      wv.removeEventListener('will-navigate', onWillNav)
+    }
+  }, [handleDidNavigate, handleWillNavigate])
+  // SPA 路由跳转（history.pushState/replaceState/hash 变化）只触发 did-navigate-in-page，
+  // 不触发 did-navigate。此时页面已用新 URL 渲染但 webview src 未变——若走 onNavigate 会
+  // 更新 tab.url → React 改 src 属性 → 整页重载、丢失 SPA 状态。因此只同步地址栏显示。
+  useEffect(() => {
+    const wv = webviewRef.current
+    if (!wv) return
+    const handler = (e) => {
+      const url = e?.url || e?.detail?.url || ''
+      if (!url || IS_WELCOME(url)) return
+      // 只认主 frame（iframe 内部路由不影响地址栏）
+      if (e?.isMainFrame === false) return
+      console.log('[browser] in-page navigate:', url)
+      onInPageNavigate(tab.id, url)
+    }
+    wv.addEventListener('did-navigate-in-page', handler)
+    return () => wv.removeEventListener('did-navigate-in-page', handler)
+  }, [onInPageNavigate])
 
   // 错误码 → 友好描述
   const errorDesc = (() => {
@@ -1356,9 +1521,25 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
     className: 'relative flex min-h-0 flex-1 flex-col' + (isActive ? '' : ' hidden'),
     children: [
       jsx('style', { dangerouslySetInnerHTML: { __html: wbKeyframes } }),
-      // 加载失败错误页：替换 webview（不覆盖），跟随宿主主题
-      loadError ? jsx('div', {
-        className: 'flex min-h-0 flex-1 flex-col items-center justify-center gap-2 px-6 text-center',
+      // webview 常驻（不因 loadError 卸载——卸载会使 webview 实例脱离 DOM，
+      // 父级持有的旧实例调用 executeJavaScript 报 "must be attached to the DOM"，
+      // 标注功能因此失效）。错误页改为覆盖层，叠加在 webview 之上。
+      jsx('webview', {
+        ref: webviewRef,
+        // src 用「实际导航目标」state 而非 tab.url：did-navigate 更新 tab.url 时若直接
+        // 改 src，Electron 会对 src 属性变化重新 loadURL（即使 URL 相同）→ MPA 整页
+        // 导航完成后二次加载（页面闪一下）。navUrl 只在「用户主动导航」时更新
+        // （handleTabNavigate 的 tab.url 变化同步 navUrl），did-navigate 完成的 URL
+        // 同步不更新 navUrl，src 保持不变，webview 自身已导航到目标 URL。
+        src: navUrl || tab.url || welcomeUrl,
+        className: 'w-full min-h-0 flex-1 border-none',
+        style: { background: webviewBg || 'var(--ui-chat-surface-background)' },
+        autosize: 'on',
+        partition: tab.partition || 'persist:hermes-browser',
+      }),
+      // 加载失败错误页覆盖层（webview 保持挂载）
+      loadError && jsx('div', {
+        className: 'absolute inset-0 z-10 flex min-h-0 flex-col items-center justify-center gap-2 px-6 text-center',
         children: [
           jsx('div', { className: 'text-4xl', children: '⚠️' }),
           jsx('div', { className: 'mt-2 text-base font-medium text-(--ui-text-primary)', children: t('errorTitle') }),
@@ -1382,18 +1563,12 @@ function TabWebview({ tab, isActive, onNavigate, onTitleChange, onNewTabRequest,
             }),
           ]}),
         ]
-      }) : jsx('webview', {
-        ref: webviewRef,
-        src: tab.url || welcomeUrl,
-        className: 'w-full min-h-0 flex-1 border-none',
-        style: { background: 'white' },
-        autosize: 'on',
-        partition: tab.partition || 'persist:hermes-browser',
-        onDidStartLoading: handleDidStartLoading,
-        onDidStopLoading: handleDidStopLoading,
-        onDidNavigate: handleDidNavigate,
-        onPageTitleUpdated: handlePageTitleUpdated,
-        onWillNavigate: handleWillNavigate,
+      }),
+      // 加载中主题色遮罩：盖住 webview guest 加载前的默认白底（新开 tab / 初次加载 /
+      // 刷新间隙统一用主题背景色，避免白屏闪烁）。不拦截鼠标事件。
+      (!loadError && bgVisible) && jsx('div', {
+        className: 'pointer-events-none absolute inset-0',
+        style: { background: webviewBg || 'var(--ui-chat-surface-background)' },
       }),
     ]
   })
@@ -1701,6 +1876,16 @@ function BrowserPane({ storage }) {
     }, hostTheme))
   }, [t, bookmarks, hostTheme])
 
+  // 刷新中间态空白页（跟随主题背景色）：reloadTab 先切到它再切回目标 URL 以强制重载，
+  // 用主题背景色替代 about:blank，避免白屏闪烁。data:text/html 前缀会被 IS_WELCOME 识别，
+  // 不会污染地址栏/历史栈。
+  const blankBgUrl = useMemo(() => {
+    const bg = hostTheme?.bg || '#161618'
+    return 'data:text/html;charset=utf-8,' + encodeURIComponent(
+      '<!DOCTYPE html><html><body style="margin:0;background:' + bg + '"></body></html>'
+    )
+  }, [hostTheme])
+
 
   // 地址栏显示：欢迎页（空 URL / data URL）不显示冗长地址
   const setInputSafe = useCallback((url) => setInputUrl(IS_WELCOME(url) ? '' : url), [])
@@ -1713,16 +1898,19 @@ function BrowserPane({ storage }) {
   const tabMenuRef = useRef(null)
   const paneRef = useRef(null)
   const [loadingMap, setLoadingMap] = useState({})  // tabId -> bool
-  const [reinjectFlag, setReinjectFlag] = useState(0)
 
   // ── Annotator 标注状态（per-tab：每个 tab 页面有自己的引擎实例，标注列表/模式互不影响）──
   const [annotationsByTab, setAnnotationsByTab] = useState({})
   const [annoActiveByTab, setAnnoActiveByTab] = useState({})
   const [annoPanelOpen, setAnnoPanelOpen] = useState(false)
-  const [annoEngineReady, setAnnoEngineReady] = useState(false)
   const activeWebviewRef = useRef(null)
   // 各 tab 引擎注入时的密钥（操作命令与消息校验按 tab 使用对应密钥；模块级 engineSecret 只作兜底）
   const secretsRef = useRef({})
+  // tab 的「最新真实 URL」ref：SPA 路由（pushState）只同步地址栏、不更新 tab.url state
+  // （避免 React 改 src 触发整页重载丢 SPA 状态），但刷新/重载/切换 tab 需要知道 webview
+  // 当前真实地址——did-navigate 与 did-navigate-in-page 都实时同步到这个 ref。
+  // 修复：Streamlit 等多页 SPA 内导航后点刷新，reloadTab 之前用过期 tab.url 跳回旧页面。
+  const realUrlRef = useRef({})
 
   // ── 标注个性化配置（持久化到 ctx.storage）──
   const [annoPasteWithImage, setAnnoPasteWithImage] = useState(() => storage.get('annoPasteWithImage', true))
@@ -1742,6 +1930,13 @@ function BrowserPane({ storage }) {
       if (wv) wv.executeJavaScript('window.__annotator && window.__annotator.setQuickTags ? window.__annotator.setQuickTags(' + on + ') : null').catch(() => {})
     } catch (e) { console.error('[browser] setQuickTags error:', e.message) }
   }, [storage])
+  // 截图最长边缩放（默认 1024；与 annotator 扩展设置一致）：
+  // 'original' 不缩放；数字 → 按最长边缩放到该像素值，降低发送 LLM 的图像 token
+  const [annoShotMaxEdge, setAnnoShotMaxEdge] = useState(() => storage.get('annoShotMaxEdge', '1024'))
+  const setAnnoShotMaxEdgePersist = useCallback((v) => {
+    setAnnoShotMaxEdge(v)
+    storage.set('annoShotMaxEdge', v)
+  }, [storage])
 
   // ── 插件全局面板：设置（居中弹窗）──
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -1758,27 +1953,21 @@ function BrowserPane({ storage }) {
   // ── 清理缓存：确认对话框 + 执行状态 ──
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false)
   const [clearing, setClearing] = useState(false)
-  // 调后端 shell 执行插件目录下的清理脚本（删插件分区磁盘缓存，保留登录态）
+  // 用 Electron session.clearCache() 清当前 partition 的 HTTP 缓存（保留 cookies/IndexedDB/登录态）。
+  // 不再走 shell 脚本：避免 %USERPROFILE%/$HOME shell 展开依赖与硬编码 HERMES_HOME 路径。
   const runClearCache = useCallback(async () => {
     setClearing(true)
     try {
-      // 跨平台：Windows 用 %USERPROFILE% + python；macOS/Linux 用 $HOME + python3。
-      // 脚本位于 HERMES_HOME/desktop-plugins 下（非 Windows 平台 HERMES_HOME 统一为 ~/.hermes）。
-      const isWin = /win/i.test(navigator.userAgent)
-      const py = isWin ? 'python' : 'python3'
-      const home = isWin ? '%USERPROFILE%' : '$HOME'
-      const script = home + '/.hermes/desktop-plugins/hermes-desktop-web-browser/script/clear_cache.py'
-      const r = await host.request('shell.exec', { command: py + ' "' + script + '"' })
-      const ok = r && (r.code === 0 || r.code === undefined || r.code === null)
-      if (ok) {
-        showToast(t('clearCacheDone'))
-        // 清理后忽略缓存强制刷新当前页，让效果立即可见
-        try { const wv = activeWebviewRef.current; if (wv && wv.reloadIgnoringCache) wv.reloadIgnoringCache() } catch (e) { console.error('[browser] reload after clear:', e.message) }
-      } else {
-        const msg = (r && r.stderr ? String(r.stderr).trim().slice(0, 150) : '')
-        showToast(t('clearCacheFail') + (msg ? ' · ' + msg : ''))
-        console.error('[browser] clear cache stderr:', msg)
+      const wv = activeWebviewRef.current
+      if (!wv || typeof wv.getWebContents !== 'function' || !wv.getWebContents().session) {
+        console.error('[browser] clear cache: webview session unavailable')
+        showToast(t('clearCacheFail'))
+        return
       }
+      await wv.getWebContents().session.clearCache()
+      showToast(t('clearCacheDone'))
+      // 清理后忽略缓存强制刷新当前页，让效果立即可见
+      try { if (wv.reloadIgnoringCache) wv.reloadIgnoringCache() } catch (e) { console.error('[browser] reload after clear:', e.message) }
     } catch (e) {
       console.error('[browser] clear cache error:', e)
       showToast(t('clearCacheFail'))
@@ -1789,32 +1978,32 @@ function BrowserPane({ storage }) {
   }, [t, showToast])
 
   // 当前激活 tab 的 webview 引用（供标注命令 / 截图使用）
-  const handleWebviewRef = useCallback((wv) => {
+  // ready 标志：webview 是否已 dom-ready（TabWebview 内部维护，随回调上抛）。
+  // 未 ready 时 executeJavaScript 同步抛错（"must be attached to the DOM"），
+  // 标注轮询 800ms 高频调用会把 Uncaught 刷屏——用此标志跳过未就绪的 webview。
+  const webviewReadyRef = useRef(false)
+  const handleWebviewRef = useCallback((wv, ready) => {
     activeWebviewRef.current = wv
+    webviewReadyRef.current = !!ready
   }, [])
-
-  // 轮询兜底：800ms 拉取引擎状态（与 new-tab 轮询同款），
-  // 即使 console-message 事件不可用也能保持 UI 同步。
-  // 无依赖：直接用 setState 函数式更新，避免 stale closure。
-  const refreshAnnotations = useCallback(() => {
+  // 标注命令统一入口：执行前探测 webview 是否可调用（未 attach/未 dom-ready 时
+  // executeJavaScript 同步抛错）。ready 缓存可能过期（webview 重建/导航中），
+  // 因此这里不信任缓存，用 try 探测兜底——同步抛错被捕获即为不可用。
+  const execAnno = useCallback((script) => {
     const wv = activeWebviewRef.current
-    if (!wv) return
-    // 轮询只同步标注模式开关（UI 状态兜底）；标注数据只来自带令牌的引擎消息，
-    // 不信任页面返回的数组（页面可覆盖 getState / getAnnotations 伪造）。
-    wv.executeJavaScript(buildStatePollScript())
-      .then((state) => {
-        if (!state) return
-        if (typeof state.active === 'boolean') setAnnoActiveByTab((prev) => ({ ...prev, [activeTabId]: state.active }))
-      })
-      .catch(() => {})
-  }, [activeTabId])
+    if (!wv) return Promise.resolve(null)
+    try {
+      return Promise.resolve(wv.executeJavaScript(script)).catch(() => null)
+    } catch (e) {
+      return Promise.resolve(null)
+    }
+  }, [])
 
   // 页面加载开始（刷新/导航/前进后退）→ 引擎随页面上下文销毁（页面上序号+边框消失），
   // 同步清空对应 tab 的插件侧标注列表，避免残留旧页面的标注
   const handleAnnoReset = useCallback((tabId) => {
     setAnnotationsByTab((prev) => ({ ...prev, [tabId]: [] }))
     setAnnoActiveByTab((prev) => ({ ...prev, [tabId]: false }))
-    setAnnoEngineReady(false)
   }, [])
 
   // 页面 → 插件事件（标注引擎消息；密钥按 tab 校验，伪造/错位消息丢弃）
@@ -1823,11 +2012,9 @@ function BrowserPane({ storage }) {
     if (msg._s !== secretsRef.current[tabId]) return
     switch (msg.type) {
       case 'ENGINE_READY':
-        setAnnoEngineReady(true)
         break
       case 'ENGINE_ERROR':
         console.error('[browser] annotator ENGINE_ERROR:', msg.error)
-        setAnnoEngineReady(false)
         break
       case 'MODE_CHANGED':
         setAnnoActiveByTab((prev) => ({ ...prev, [tabId]: !!msg.active }))
@@ -1854,74 +2041,93 @@ function BrowserPane({ storage }) {
     secretsRef.current[tabId] = secret
   }, [])
 
+  // 轮询：800ms 拉取引擎状态 + 消息队列（标注消息不再经 console——console 可被页面劫持）。
+  // msgs 带 _s 令牌，逐条走 handleAnnoEvent 密钥校验；页面替换引擎伪造的数据会被拒收。
+  const refreshAnnotations = useCallback(() => {
+    const wv = activeWebviewRef.current
+    // 不依赖 ready 缓存（可能因上抛链路时序未同步），直接用 try 兜底：
+    // executeJavaScript 在 webview 未 attach/未 dom-ready 时同步抛错，被 catch 捕获
+    // 即跳过（不会刷屏——同步错误不会进 console，与之前 90 条 Uncaught 不同）。
+    if (!wv) return
+    const secret = secretsRef.current[activeTabId] || engineSecret
+    try {
+      wv.executeJavaScript(buildPollScript(secret))
+        .then((state) => {
+          if (!state) return
+          if (typeof state.active === 'boolean') setAnnoActiveByTab((prev) => ({ ...prev, [activeTabId]: state.active }))
+          if (Array.isArray(state.msgs)) {
+            for (const msg of state.msgs) handleAnnoEvent(activeTabId, msg)
+          }
+        })
+        .catch(() => {})
+    } catch (e) {}
+  }, [activeTabId, handleAnnoEvent, secretsRef])
+
+  // 常驻轮询（不依赖标注面板开关：注入后的 ENGINE_READY / 用户标注消息都走这里）
   useEffect(() => {
-    if (!annoPanelOpen) return
     const timer = setInterval(refreshAnnotations, 800)
     return () => clearInterval(timer)
-  }, [annoPanelOpen, refreshAnnotations])
+  }, [refreshAnnotations])
 
   // 标注命令：切换标注模式（作用于当前激活 tab 的引擎）
   const toggleAnnotationMode = useCallback(() => {
     const wv = activeWebviewRef.current
     if (!wv) return
     const secret = secretsRef.current[activeTabId] || engineSecret
-    wv.executeJavaScript('window.__annotator ? window.__annotator.toggleAnnotation(' + JSON.stringify(secret) + ') : "NOT_READY"')
+    // 用 execAnno 统一执行（内部 try 兜底，不再依赖可能过期的 ready 缓存）
+    execAnno('window.__annotator ? window.__annotator.toggleAnnotation(' + JSON.stringify(secret) + ') : "NOT_READY"')
       .then((r) => {
         if (r === 'NOT_READY') {
           // 引擎未注入：立即注入后再切换
           const s = genEngineSecret()
           secretsRef.current[activeTabId] = s
           const engineScript = buildAnnotationEngineScript(engineLang, annoQuickTags, s)
-          return wv.executeJavaScript(engineScript).then(() => {
+          return execAnno(engineScript).then(() => {
             console.log('[browser] annotator engine injected on-demand')
-            return wv.executeJavaScript('window.__annotator.toggleAnnotation(' + JSON.stringify(s) + ')')
+            return execAnno('window.__annotator.toggleAnnotation(' + JSON.stringify(s) + ')')
           })
         }
       })
       .then((r) => { if (r && typeof r.active === 'boolean') setAnnoActiveByTab((prev) => ({ ...prev, [activeTabId]: r.active })) })
       .catch((err) => console.error('[browser] toggle annotation error:', err.message))
-  }, [engineLang, annoQuickTags, activeTabId])
+  }, [engineLang, annoQuickTags, activeTabId, execAnno])
 
   // 强制退出标注模式（导航后 / 页面切换时调用；引擎会回传 MODE_CHANGED 同步 annoActiveByTab）
   const handleAnnoStop = useCallback(() => {
     const wv = activeWebviewRef.current
     if (!wv) return
     const secret = secretsRef.current[activeTabId] || engineSecret
-    wv.executeJavaScript('window.__annotator ? window.__annotator.stopAnnotation(' + JSON.stringify(secret) + ') : null')
-      .catch(() => {})
-  }, [activeTabId])
+    execAnno('window.__annotator ? window.__annotator.stopAnnotation(' + JSON.stringify(secret) + ') : null')
+  }, [activeTabId, execAnno])
 
   const clearAnnotations = useCallback(() => {
     const wv = activeWebviewRef.current
     if (!wv) return
     const secret = secretsRef.current[activeTabId] || engineSecret
-    wv.executeJavaScript('window.__annotator ? window.__annotator.clearAnnotations(' + JSON.stringify(secret) + ') : null')
+    execAnno('window.__annotator ? window.__annotator.clearAnnotations(' + JSON.stringify(secret) + ') : null')
       .then(() => { setAnnotationsByTab((prev) => ({ ...prev, [activeTabId]: [] })) })
-      .catch(() => {})
-  }, [activeTabId])
+  }, [activeTabId, execAnno])
 
   const deleteAnnotation = useCallback((idx) => {
     const wv = activeWebviewRef.current
     if (!wv) return
     const secret = secretsRef.current[activeTabId] || engineSecret
-    wv.executeJavaScript('window.__annotator ? window.__annotator.deleteAnnotation(' + Number(idx) + ', ' + JSON.stringify(secret) + ') : null')
+    execAnno('window.__annotator ? window.__annotator.deleteAnnotation(' + Number(idx) + ', ' + JSON.stringify(secret) + ') : null')
       .then(() => refreshAnnotations())
-      .catch(() => {})
-  }, [refreshAnnotations, activeTabId])
+  }, [refreshAnnotations, activeTabId, execAnno])
 
   const updateAnnotation = useCallback((idx, note) => {
     const wv = activeWebviewRef.current
     if (!wv) return
     const secret = secretsRef.current[activeTabId] || engineSecret
     const safeNote = JSON.stringify(String(note || ''))
-    wv.executeJavaScript('window.__annotator ? window.__annotator.updateAnnotation(' + Number(idx) + ', ' + safeNote + ', ' + JSON.stringify(secret) + ') : null')
+    execAnno('window.__annotator ? window.__annotator.updateAnnotation(' + Number(idx) + ', ' + safeNote + ', ' + JSON.stringify(secret) + ') : null')
       .then(() => refreshAnnotations())
-      .catch(() => {})
-  }, [refreshAnnotations, activeTabId])
+  }, [refreshAnnotations, activeTabId, execAnno])
 
   // 从插件侧可信标注数据生成 prompt（不调用页面函数，防网页覆盖返回伪造文本）
   const getFormattedPrompt = useCallback(() => {
-    return Promise.resolve(formatAnnotationsPrompt(annotationsByTab[activeTabId] || [], 'zh', annoPasteWithImage))
+    return Promise.resolve(formatAnnotationsPrompt(annotationsByTab[activeTabId] || [], engineLang, annoPasteWithImage))
   }, [annotationsByTab, activeTabId, annoPasteWithImage])
 
   // 引擎当前标注数量（插件侧权威值，避免无标注时仍复制出 "(no annotations)" 的 prompt）
@@ -1940,9 +2146,10 @@ function BrowserPane({ storage }) {
       const img = await wv.capturePage()
       if (!img || typeof img.toDataURL !== 'function') return null
       let dataUrl = img.toDataURL()
-      // 缩放：渲染进程可用 canvas
+      // 缩放：渲染进程可用 canvas；最长边取设置值（'original' 不缩放）
       try {
-        const maxEdge = 1024
+        const maxEdge = (annoShotMaxEdge === 'original') ? 0 : (Number(annoShotMaxEdge) || 1024)
+        if (!maxEdge || maxEdge <= 0) return dataUrl // 'original' 或不合法值 → 不缩放
         const out = await new Promise((resolve) => {
           const canvas = document.createElement('canvas')
           const ctx = canvas.getContext('2d')
@@ -1966,7 +2173,7 @@ function BrowserPane({ storage }) {
       console.error('[browser] capturePage error:', e.message)
       return null
     }
-  }, [])
+  }, [annoShotMaxEdge])
 
   const dataUrlToBlob = useCallback((dataUrl) => {
     const [head, b64] = dataUrl.split(',')
@@ -1988,7 +2195,7 @@ function BrowserPane({ storage }) {
   // 开 → 结构化 Prompt + 截图（文本+图片同剪贴板；失败降级纯文本+下载图）
   // 关 → 仅 Prompt 纯文本
   const copyBoth = useCallback(async () => {
-    const count = await getAnnoCount()
+    const count = getAnnoCount()
     if (!count) { showToast(t('annoToastNoAnno')); return false }
     const text = await getFormattedPrompt()
     if (!text) return false
@@ -2021,7 +2228,7 @@ function BrowserPane({ storage }) {
   // contentEditable，复用 Hermes 自己的 handlePaste 流程（文本清洗 + 图片附件）。
   // 是否附带截图由配置 annoPasteWithImage 控制（持久化）。
   const pasteToComposer = useCallback(async () => {
-    const count = await getAnnoCount()
+    const count = getAnnoCount()
     if (!count) { showToast(t('annoToastNoAnno')); return }
     const text = await getFormattedPrompt()
     if (!text) return
@@ -2084,45 +2291,49 @@ function BrowserPane({ storage }) {
     setTabs((prev) => [...prev, { id, url, title: '', partition: nextPartition() }])
     setActiveTabId(id)
     setInputSafe(url)
+    realUrlRef.current[id] = url || ''
     updateTabHistory(id, { stack: [url], idx: 0 })
     return id
   }, [updateTabHistory, cacheDisabled])
 
   // ── 关闭 Tab ──
   const closeTab = useCallback((tabId) => {
-    // 释放该 tab 的标注状态与密钥（per-tab 数据随 tab 关闭清理）
+    // 释放该 tab 的标注状态、密钥、浏览历史与加载状态（per-tab 数据随 tab 关闭清理）
     setAnnotationsByTab((prev) => { const next = { ...prev }; delete next[tabId]; return next })
     setAnnoActiveByTab((prev) => { const next = { ...prev }; delete next[tabId]; return next })
     delete secretsRef.current[tabId]
-    setTabs((prev) => {
-      const idx = prev.findIndex((t) => t.id === tabId)
-      if (prev.length <= 1) {
-        // 最后一个 tab 不关闭：普通页面重置为新标签页；已是新标签页则不操作
-        const only = prev[0]
-        if (IS_WELCOME(only.url)) return prev
-        if (tabId === activeTabId) setInputSafe('')
-        updateTabHistory(tabId, { stack: [''], idx: 0 })
-        return [{ ...only, url: '', title: '' }]
-      }
-      const next = prev.filter((t) => t.id !== tabId)
-      // 如果关闭的是当前 tab，切换到相邻 tab
-      if (tabId === activeTabId) {
-        const newActive = next[Math.min(idx, next.length - 1)]
-        setActiveTabId(newActive.id)
-        setInputSafe(newActive.url)
-      }
-      return next
-    })
-  }, [activeTabId, updateTabHistory])
+    delete realUrlRef.current[tabId]
+    setHistory((prev) => { const next = { ...prev }; delete next[tabId]; return next })
+    setLoadingMap((prev) => { const next = { ...prev }; delete next[tabId]; return next })
+    const idx = tabs.findIndex((t) => t.id === tabId)
+    if (tabs.length <= 1) {
+      // 最后一个 tab 不关闭：普通页面重置为新标签页；已是新标签页则不操作
+      const only = tabs[0]
+      if (IS_WELCOME(only.url)) return
+      if (tabId === activeTabId) setInputSafe('')
+      updateTabHistory(tabId, { stack: [''], idx: 0 })
+      setTabs([{ ...only, url: '', title: '' }])
+      return
+    }
+    const next = tabs.filter((t) => t.id !== tabId)
+    // 如果关闭的是当前 tab，切换到相邻 tab（副作用移出 setTabs updater，避免 StrictMode 双调用）
+    if (tabId === activeTabId) {
+      const newActive = next[Math.min(idx, next.length - 1)]
+      setActiveTabId(newActive.id)
+      setInputSafe(realUrlRef.current[newActive.id] || newActive.url)
+    }
+    setTabs(next)
+  }, [activeTabId, updateTabHistory, tabs, setInputSafe])
 
   // ── 切换 Tab ──
   const switchTab = useCallback((tabId) => {
     const tab = tabs.find((t) => t.id === tabId)
     if (tab) {
       setActiveTabId(tabId)
-      setInputSafe(tab.url)
+      // 地址栏显示最新真实 URL（SPA 路由后 tab.url 可能过期）
+      setInputSafe(realUrlRef.current[tabId] || tab.url)
     }
-  }, [tabs])
+  }, [tabs, setInputSafe])
 
   // ── 新窗口请求 → 新 Tab ──
   const handleNewTabRequest = useCallback((url) => {
@@ -2136,11 +2347,18 @@ function BrowserPane({ storage }) {
     // 切换到目标 tab 的 URL 重新设置以触发刷新
     const tab = tabs.find((t) => t.id === tabId)
     if (!tab) return
-    setTabs((prev) => prev.map((t) => t.id === tabId ? { ...t, url: '' } : t))
+    // 刷新目标用「最新真实 URL」（含 SPA 路由后的地址）而非 tab.url：
+    // SPA（pushState）内导航不更新 tab.url，用过期值刷新会跳回旧页面
+    // （如 Streamlit 从 /statistics 刷新跳回 /dashboard）。
+    const target = realUrlRef.current[tabId] || tab.url
+    // 中间态用主题背景色空白页（data URL）而非空串/about:blank：
+    // 空串会让 src 回落到欢迎页 data URL（欢迎页一闪而过），
+    // about:blank 是纯白（白屏刺眼）；主题色空白页无缝衔接主题。
+    setTabs((prev) => prev.map((t) => t.id === tabId ? { ...t, url: blankBgUrl } : t))
     setTimeout(() => {
-      setTabs((prev) => prev.map((t) => t.id === tabId ? { ...t, url: tab.url } : t))
+      setTabs((prev) => prev.map((t) => t.id === tabId ? { ...t, url: target } : t))
     }, 50)
-  }, [tabs])
+  }, [tabs, blankBgUrl])
 
   // ── 停止加载当前 tab ──
   const stopTabLoad = useCallback((tabId) => {
@@ -2152,6 +2370,8 @@ function BrowserPane({ storage }) {
 
   // ── Tab 内导航回调 ──
   const handleTabNavigate = useCallback((tabId, url) => {
+    // 整页导航完成的 URL 同步到真实 URL ref（欢迎页/空白中间态不算）
+    if (url && !IS_WELCOME(url)) realUrlRef.current[tabId] = url
     setTabs((prev) => prev.map((t) => t.id === tabId ? { ...t, url } : t))
     if (tabId === activeTabId) {
       setInputSafe(url)
@@ -2161,7 +2381,15 @@ function BrowserPane({ storage }) {
       newStack.push(url)
       return { stack: newStack, idx: newStack.length - 1 }
     })
-  }, [activeTabId, updateTabHistory])
+  }, [activeTabId, updateTabHistory, setInputSafe])
+
+  // ── SPA 页内路由（did-navigate-in-page）回调 ──
+  // 页面已通过 history API 换路由，webview src 未变。只同步地址栏显示 + 真实 URL ref，
+  // 不更新 tab.url——否则 React 改 src 属性会触发整页重载、丢失 SPA 状态。
+  const handleInPageNavigate = useCallback((tabId, url) => {
+    setInputSafe(url)
+    if (url && !IS_WELCOME(url)) realUrlRef.current[tabId] = url
+  }, [setInputSafe])
 
   // ── Tab 标题回调 ──
   const handleTabTitleChange = useCallback((tabId, title) => {
@@ -2446,7 +2674,7 @@ function BrowserPane({ storage }) {
           // 标注模式按钮
           jsx('button', {
             type: 'button',
-            onClick: () => { closeMenu(); setAnnoPanelOpen(true); toggleAnnotationMode() },
+            onClick: () => { closeMenu(); setAnnoPanelOpen(true); toggleAnnotationMode(); setTimeout(refreshAnnotations, 300) },
             className: [
               'inline-flex size-6 items-center justify-center rounded',
               currentAnnoActive
@@ -2552,9 +2780,10 @@ function BrowserPane({ storage }) {
             tab,
             isActive: tab.id === activeTabId,
             onNavigate: handleTabNavigate,
+            onInPageNavigate: handleInPageNavigate,
             onTitleChange: handleTabTitleChange,
             onNewTabRequest: handleNewTabRequest,
-            onAnnoEvent: handleAnnoEvent,
+            secretsRef,
             onAnnoReset: handleAnnoReset,
             onSecretChange: handleSecretChange,
             annoActive: !!annoActiveByTab[tab.id],
@@ -2562,7 +2791,7 @@ function BrowserPane({ storage }) {
             onWebviewRef: handleWebviewRef,
             onPageClick: handlePageClick,
             welcomeUrl,
-            reinjectFlag,
+            webviewBg: hostTheme?.bg || '#161618',
             onLoadingChange: handleLoadingChange,
             annoQuickTags,
           })
@@ -2691,6 +2920,13 @@ function BrowserPane({ storage }) {
             }),
             // ── 分类：标注 ──
             jsx('div', { style: { fontSize: 10, color: 'var(--ui-text-quaternary)', marginTop: 14 }, children: t('settingsSectionAnnotate') }),
+            jsx('label', {
+              style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginTop: 8 },
+              children: [
+                jsx('span', { style: { flex: 1, fontSize: 11, color: 'var(--ui-text-primary)' }, children: t('annoQuickTags') }),
+                jsx(Switch, { checked: annoQuickTags, onCheckedChange: (v) => setAnnoQuickTagsPersist(!!v), size: 'xs' }),
+              ]
+            }),
             // 标注设置项（文字在前，开关在右，类似手机设置项）
             jsx('label', {
               style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginTop: 8 },
@@ -2699,11 +2935,27 @@ function BrowserPane({ storage }) {
                 jsx(Switch, { checked: annoPasteWithImage, onCheckedChange: (v) => setPasteWithImagePersist(!!v), size: 'xs' }),
               ]
             }),
+            // 截图最长边缩放（与 annotator 扩展设置一致）：文字在前，下拉在右
             jsx('label', {
-              style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginTop: 8 },
+              style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 },
               children: [
-                jsx('span', { style: { flex: 1, fontSize: 11, color: 'var(--ui-text-primary)' }, children: t('annoQuickTags') }),
-                jsx(Switch, { checked: annoQuickTags, onCheckedChange: (v) => setAnnoQuickTagsPersist(!!v), size: 'xs' }),
+                jsx('span', { style: { flex: 1, fontSize: 11, color: 'var(--ui-text-primary)' }, children: t('annoShotMaxEdge') }),
+                jsx('select', {
+                  value: annoShotMaxEdge,
+                  onChange: (e) => setAnnoShotMaxEdgePersist(e.target.value),
+                  style: {
+                    fontSize: 11, color: 'var(--ui-text-primary)',
+                    backgroundColor: 'var(--ui-surface-background)',
+                    border: '1px solid var(--ui-stroke-secondary)',
+                    borderRadius: 6, padding: '2px 6px', cursor: 'pointer',
+                  },
+                  children: [
+                    jsx('option', { value: 'original', children: t('annoShotOriginal') }),
+                    jsx('option', { value: '1280', children: '1280' }),
+                    jsx('option', { value: '1024', children: '1024' }),
+                    jsx('option', { value: '768', children: '768' }),
+                  ],
+                }),
               ]
             }),
             // 清理缓存确认对话框（覆盖整个面板，盖住设置弹窗）
@@ -2795,7 +3047,7 @@ export default {
         // 用函数返回数组即可透传，欢迎页轮播需要真实数组。
         welcomeTips: () => [
           '页面标注功能：在网页元素上添加标记与说明，可一键复制到对话',
-          '如果模型不支持图片分析，可以在设置中关闭「复制时附带截图」',
+          '如果模型不支持图片分析，可以在设置中关闭「启用截图功能」',
           '标注时点击快捷标签（Bug/样式/布局等），自动填入对应修改指令',
         ],
         annotate: '页面标注',
@@ -2806,8 +3058,9 @@ export default {
         annoCopyBothShort: '复制提示词+图', annoCopyPromptShort: '复制提示词',
         annoClear: '清空', annoEmpty: '暂无标注，点击「开始标注」后在页面上点击元素添加',
         annoSave: '保存', annoCancel: '取消', annoEdit: '编辑', annoDelete: '删除', annoNoNote: '（无说明）',
-        annoSettings: '设置', annoClose: '关闭', annoPasteWithImage: '复制时附带截图',
-        annoQuickTags: '快捷标注标签',
+        annoSettings: '设置', annoClose: '关闭', annoPasteWithImage: '启用截图功能',
+ annoQuickTags: '快捷标注标签',
+ annoShotMaxEdge: '截图缩放,最长边', annoShotOriginal: '原始',
         cacheDisabled: '禁用浏览器缓存', clearCache: '清理缓存',
         settingsSectionBrowser: '浏览器', settingsSectionAnnotate: '标注',
         clearCacheConfirmTitle: '清理缓存',
@@ -2832,7 +3085,7 @@ export default {
         welcomeTitle: 'Browser', welcomeSub: 'Enter a URL in the address bar to start browsing',
         welcomeTips: () => [
           'Page annotation: mark any element on a page, add a note, and copy it into your chat in one click',
-          'If your model cannot analyze images, turn off "Include screenshot when copying" in settings',
+          'If your model cannot analyze images, turn off "Enable screenshots" in settings',
           'Click a quick tag (Bug/Style/Layout) while annotating to auto-fill the instruction',
         ],
         annotate: 'Annotate',
@@ -2843,8 +3096,9 @@ export default {
         annoCopyBothShort: 'Copy prompt+shot', annoCopyPromptShort: 'Copy prompt',
         annoClear: 'Clear', annoEmpty: 'No annotations yet — click "Start" then click an element on the page',
         annoSave: 'Save', annoCancel: 'Cancel', annoEdit: 'Edit', annoDelete: 'Delete', annoNoNote: '(no note)',
-        annoSettings: 'Settings', annoClose: 'Close', annoPasteWithImage: 'Include screenshot when copying',
-        annoQuickTags: 'Quick annotation tags',
+        annoSettings: 'Settings', annoClose: 'Close', annoPasteWithImage: 'Enable screenshots',
+ annoQuickTags: 'Quick annotation tags',
+ annoShotMaxEdge: 'Screenshot scale, max edge', annoShotOriginal: 'Original',
         cacheDisabled: 'Disable browser cache', clearCache: 'Clear cache',
         settingsSectionBrowser: 'Browser', settingsSectionAnnotate: 'Annotations',
         clearCacheConfirmTitle: 'Clear cache',
