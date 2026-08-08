@@ -3180,7 +3180,9 @@ export default {
     })
 
     // ── 浏览器面板 ──
-    const $visible = atom(false)
+    // 打开状态持久化到 storage：插件热重载/桌面刷新后按上次状态注册，
+    // 面板不再因重载而凭空消失（$visible 只存内存会导致每次 register() 都回到关闭）。
+    const $visible = atom(ctx.storage.get('paneVisible', false))
 
     const registerPane = (visible) => {
       const t = ctx.i18n.t
@@ -3202,10 +3204,11 @@ export default {
     const togglePane = () => {
       const next = !$visible.get()
       $visible.set(next)
+      ctx.storage.set('paneVisible', next)
       registerPane(next)
     }
 
-    registerPane(false)
+    registerPane($visible.get())
 
     // 暴露浏览器 toggle 给全局启动器
     window.__pluginToggles = window.__pluginToggles || {}
